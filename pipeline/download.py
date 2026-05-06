@@ -224,6 +224,7 @@ def download_to_file(
     last_exc: Optional[Exception] = None
 
     for attempt in range(1, MAX_RETRIES + 1):
+        written = 0
         try:
             resp = _open_stream(url, session=session)
 
@@ -237,7 +238,6 @@ def download_to_file(
                         f"file is {total} bytes, larger than max ({max_bytes})"
                     )
 
-            written = 0
             last_emit = 0.0
             try:
                 with open(dest, "wb", buffering=2 * 1024 * 1024) as f:

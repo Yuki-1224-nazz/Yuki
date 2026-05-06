@@ -166,10 +166,22 @@ def extract_archive(
         raise ArchiveError(f"extractor binary not found: {exc}") from exc
 
     if proc.returncode != 0:
-        # 7z returns 2 for "fatal error" which is what we get on a bad
-        # password; surface a friendly message either way.
+        # 7z exit codes: 0=ok, 1=warnings (some files skipped),
+        # 2=fatal error. For code 1 or 2, check if any files were
+        # actually extracted before raising.
+        extracted_any = dest_dir.exists() and any(dest_dir.iterdir())
         stderr = (proc.stderr or proc.stdout or "").strip().splitlines()
         tail = stderr[-1] if stderr else f"rc={proc.returncode}"
-        raise ArchiveError(f"extraction failed: {tail}")
+
+        if proc.returncode == 1 and extracted_any:
+            log.warning("extraction completed with warnings: %s", tail)
+        elif extracted_any:
+            log.warning(
+                "extraction had errors (rc=%d) but some files extracted: %s",
+                proc.returncode,
+                tail,
+            )
+        else:
+            raise ArchiveError(f"extraction failed: {tail}")
 
     return dest_dir

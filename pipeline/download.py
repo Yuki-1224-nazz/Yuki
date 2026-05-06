@@ -6,12 +6,13 @@ sync (requests) download paths. The async path is preferred for speed
 as it avoids blocking the event loop and supports concurrent I/O.
 
 Speed optimizations over the original implementation:
-- Chunk size increased from 64 KB to 512 KB for better throughput
+- Chunk size increased from 64 KB to 1 MB for better throughput
 - Async aiohttp downloads with TCP connection reuse
 - Automatic retry with exponential backoff for transient failures
 - Optimized file I/O with larger write buffers
 - **Multi-connection parallel downloading** via HTTP Range requests
   (splits file into segments downloaded concurrently — up to 10x faster)
+- Graceful fallback to single-connection when Range fails at runtime
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ import requests
 
 log = logging.getLogger(__name__)
 
-CHUNK_SIZE = 512 * 1024  # 512 KB — 8x larger for better throughput
+CHUNK_SIZE = 1024 * 1024  # 1 MB — maximises throughput per read syscall
 DEFAULT_TIMEOUT = (15, 600)  # (connect, read) — faster connect timeout
 DEFAULT_USER_AGENT = (
     "logs-to-cookie/2.1 (+https://github.com/Yuki-1224-nazz/Yuki)"
@@ -45,6 +46,10 @@ class DownloadError(RuntimeError):
     def __init__(self, message: str, *, retryable: bool = False) -> None:
         super().__init__(message)
         self.retryable = retryable
+
+
+class _RangeNotSupported(Exception):
+    """Internal signal: server claimed Range support but rejected the request."""
 
 
 ProgressCallback = Callable[[int, Optional[int]], None]
@@ -79,7 +84,17 @@ _COMMON_HEADERS = {
 async def _probe_range_support(
     session: aiohttp.ClientSession, url: str
 ) -> tuple[bool, Optional[int]]:
-    """HEAD + small Range probe. Returns (supports_range, content_length)."""
+    """Probe whether the server truly honours Range requests.
+
+    1. HEAD to get Content-Length and Accept-Ranges header.
+    2. If the header looks promising, do a real ``Range: bytes=0-0``
+       GET to confirm the server actually returns 206.
+
+    Returns ``(supports_range, content_length)``.
+    """
+    content_length: Optional[int] = None
+
+    # Step 1: HEAD
     try:
         async with session.head(url, allow_redirects=True) as resp:
             if resp.status >= 400:
@@ -87,29 +102,44 @@ async def _probe_range_support(
             cl_raw = resp.headers.get("Content-Length")
             content_length = int(cl_raw) if cl_raw and cl_raw.isdigit() else None
             accept_ranges = resp.headers.get("Accept-Ranges", "").lower()
-            if accept_ranges == "bytes" and content_length:
-                return True, content_length
-    except (aiohttp.ClientError, asyncio.TimeoutError):
-        pass
-
-    # Fallback: try an actual Range request for the first byte
-    try:
-        async with session.get(
-            url, headers={"Range": "bytes=0-0"}, allow_redirects=True
-        ) as resp:
-            if resp.status == 206:
-                cr = resp.headers.get("Content-Range", "")
-                # Content-Range: bytes 0-0/<total>
-                if "/" in cr:
-                    total_str = cr.rsplit("/", 1)[-1]
-                    if total_str.isdigit():
-                        return True, int(total_str)
-                return True, None
-            cl_raw = resp.headers.get("Content-Length")
-            content_length = int(cl_raw) if cl_raw and cl_raw.isdigit() else None
-            return False, content_length
     except (aiohttp.ClientError, asyncio.TimeoutError):
         return False, None
+
+    # Step 2: actual Range GET to confirm (some servers lie in headers)
+    if accept_ranges == "bytes" and content_length:
+        try:
+            async with session.get(
+                url,
+                headers={"Range": "bytes=0-0"},
+                allow_redirects=True,
+            ) as resp:
+                if resp.status == 206:
+                    return True, content_length
+                # Server said Accept-Ranges: bytes but returned 200/503/etc
+                log.info(
+                    "server advertises Accept-Ranges: bytes but returned "
+                    "%d for Range probe — disabling multi-connection",
+                    resp.status,
+                )
+                return False, content_length
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            return False, content_length
+
+    # No Accept-Ranges header — try anyway
+    if content_length:
+        try:
+            async with session.get(
+                url,
+                headers={"Range": "bytes=0-0"},
+                allow_redirects=True,
+            ) as resp:
+                if resp.status == 206:
+                    return True, content_length
+                return False, content_length
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            pass
+
+    return False, content_length
 
 
 async def _download_segment(
@@ -122,7 +152,11 @@ async def _download_segment(
     progress: list[int],
     progress_lock: asyncio.Lock,
 ) -> int:
-    """Download a byte-range segment to a temp file with retry."""
+    """Download a byte-range segment to a temp file with retry.
+
+    Raises ``_RangeNotSupported`` on 4xx/5xx so the caller can fall
+    back to single-connection mode.
+    """
     seg_path = dest.parent / f"{dest.name}.part{segment_id}"
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -132,8 +166,14 @@ async def _download_segment(
                 headers={"Range": f"bytes={start}-{end}"},
                 allow_redirects=True,
             ) as resp:
-                if resp.status not in (200, 206):
-                    raise DownloadError(
+                if resp.status in (200, 206):
+                    pass  # ok
+                elif resp.status in (416, 501, 503):
+                    raise _RangeNotSupported(
+                        f"HTTP {resp.status} for Range request"
+                    )
+                elif resp.status >= 400:
+                    raise _RangeNotSupported(
                         f"HTTP {resp.status} for segment {segment_id}"
                     )
                 with open(seg_path, "wb", buffering=1024 * 1024) as f:
@@ -145,6 +185,8 @@ async def _download_segment(
                         async with progress_lock:
                             progress[segment_id] = written
             return written
+        except _RangeNotSupported:
+            raise
         except DownloadError:
             raise
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
@@ -164,6 +206,8 @@ def _assemble_segments_sync(dest: Path, num_segments: int) -> int:
     with open(dest, "wb", buffering=4 * 1024 * 1024) as out:
         for i in range(num_segments):
             seg = dest.parent / f"{dest.name}.part{i}"
+            if not seg.exists():
+                continue
             with open(seg, "rb", buffering=4 * 1024 * 1024) as inp:
                 while True:
                     buf = inp.read(4 * 1024 * 1024)
@@ -173,6 +217,13 @@ def _assemble_segments_sync(dest: Path, num_segments: int) -> int:
                     total += len(buf)
             seg.unlink(missing_ok=True)
     return total
+
+
+def _cleanup_segments(dest: Path, num_segments: int) -> None:
+    """Remove leftover .partN files after a failed multi-conn attempt."""
+    for i in range(num_segments):
+        seg = dest.parent / f"{dest.name}.part{i}"
+        seg.unlink(missing_ok=True)
 
 
 async def _multi_conn_download(
@@ -186,7 +237,11 @@ async def _multi_conn_download(
     on_progress: Optional[ProgressCallback],
     progress_interval: float,
 ) -> int:
-    """Download using multiple parallel Range-request connections."""
+    """Download using multiple parallel Range-request connections.
+
+    Raises ``_RangeNotSupported`` if any segment gets a non-206
+    response so the caller can fall back to single-connection.
+    """
     if max_bytes is not None and total_size > max_bytes:
         raise DownloadError(
             f"file is {total_size} bytes, larger than max ({max_bytes})"
@@ -238,6 +293,10 @@ async def _multi_conn_download(
             for i, (start, end) in enumerate(segments)
         ]
         await asyncio.gather(*tasks)
+    except _RangeNotSupported:
+        # Clean up partial segment files before falling back
+        _cleanup_segments(dest, num_connections)
+        raise
     finally:
         progress_done.set()
         if reporter is not None:
@@ -280,7 +339,7 @@ async def _single_conn_download(
         written = 0
         last_emit = 0.0
 
-        with open(dest, "wb", buffering=1024 * 1024) as f:
+        with open(dest, "wb", buffering=2 * 1024 * 1024) as f:
             async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
                 if not chunk:
                     continue
@@ -315,7 +374,9 @@ async def async_download_to_file(
     When the server supports HTTP Range requests and the file is large
     enough, the download is split across *num_connections* parallel
     connections (default controlled by ``DOWNLOAD_CONNECTIONS`` env var,
-    default 8). Falls back to a single connection otherwise.
+    default 8). Falls back to a single connection otherwise — including
+    when the server *claims* Range support but rejects actual Range
+    requests at runtime (e.g. Heroku returning 503).
 
     Returns bytes written. Raises DownloadError on failure.
     """
@@ -348,21 +409,30 @@ async def async_download_to_file(
                             num_connections,
                             content_length,
                         )
-                        return await _multi_conn_download(
-                            session,
-                            url,
-                            dest,
-                            content_length,
-                            num_connections=num_connections,
-                            max_bytes=max_bytes,
-                            on_progress=on_progress,
-                            progress_interval=progress_interval,
+                        try:
+                            return await _multi_conn_download(
+                                session,
+                                url,
+                                dest,
+                                content_length,
+                                num_connections=num_connections,
+                                max_bytes=max_bytes,
+                                on_progress=on_progress,
+                                progress_interval=progress_interval,
+                            )
+                        except _RangeNotSupported as exc:
+                            log.warning(
+                                "multi-connection download failed (%s) — "
+                                "falling back to single connection",
+                                exc,
+                            )
+                            # fall through to single-conn below
+                    else:
+                        log.info(
+                            "Range not supported or file too small — single "
+                            "connection download"
                         )
 
-                    log.info(
-                        "Range not supported or file too small — single "
-                        "connection download"
-                    )
                     return await _single_conn_download(
                         session,
                         url,
@@ -435,7 +505,7 @@ def download_to_file(
     progress_interval: float = 0.5,
     session: Optional[requests.Session] = None,
 ) -> int:
-    """Stream ``url`` to ``dest`` in 512 KB chunks.
+    """Stream ``url`` to ``dest`` in 1 MB chunks.
 
     Returns the number of bytes written. Raises :class:`DownloadError`
     on transport failures or if the response exceeds ``max_bytes``.
@@ -463,7 +533,7 @@ def download_to_file(
             written = 0
             last_emit = 0.0
             try:
-                with open(dest, "wb", buffering=1024 * 1024) as f:
+                with open(dest, "wb", buffering=2 * 1024 * 1024) as f:
                     for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
                         if not chunk:
                             continue

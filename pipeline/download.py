@@ -287,6 +287,7 @@ async def async_download_to_file(
     on_progress: Optional[ProgressCallback] = None,
     progress_interval: float = 0.5,
     num_connections: int = DEFAULT_CONNECTIONS,
+    extra_headers: Optional[dict[str, str]] = None,
 ) -> int:
     """Async download with automatic multi-connection acceleration.
 
@@ -297,10 +298,14 @@ async def async_download_to_file(
     Range-request connections. If the server rejects Range requests at
     runtime, falls back to a fresh single-connection download.
 
+    Pass *extra_headers* to add custom headers (e.g. cookies for
+    authenticated downloads like gofile.io).
+
     Returns bytes written. Raises DownloadError on failure.
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
     connector = _make_connector(num_connections)
+    merged_headers = {**_COMMON_HEADERS, **(extra_headers or {})}
 
     last_exc: Optional[Exception] = None
     try:
@@ -310,7 +315,7 @@ async def async_download_to_file(
                     connector=connector,
                     connector_owner=False,
                     timeout=_make_timeout(),
-                    headers=_COMMON_HEADERS,
+                    headers=merged_headers,
                 ) as session:
                     # --- Start a normal GET immediately (no probe) ---
                     async with session.get(

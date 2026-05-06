@@ -20,6 +20,7 @@ from .download import (
     download_to_file,
     stream_lines,
 )
+from .gofile import GofileError, is_gofile_url, resolve_gofile_url
 from .pipeline import PipelineResult, async_run_pipeline, run_pipeline
 
 __all__ = [
@@ -27,6 +28,7 @@ __all__ = [
     "ArchiveError",
     "CookieRow",
     "DownloadError",
+    "GofileError",
     "NETSCAPE_HEADER",
     "PipelineResult",
     "async_download_to_file",
@@ -36,7 +38,9 @@ __all__ = [
     "extract_archive",
     "extract_cookies_from_text",
     "is_archive_url",
+    "is_gofile_url",
     "parse_cookie_line",
+    "resolve_gofile_url",
     "run_pipeline",
     "stream_lines",
     "write_netscape_file",

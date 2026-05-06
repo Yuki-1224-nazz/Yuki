@@ -192,9 +192,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "👋 *logs-to-cookie* — Netscape cookie converter\n\n"
         "Send me one or more *direct download URLs* to your logs "
         "(comma or space separated). I accept any `http(s)` link "
-        "— zip, 7z, rar, or tokenised CDN paths. I'll download "
-        "them all in parallel, extract every Netscape cookie, and "
-        "send the results back as a single zip.\n\n"
+        "— zip, 7z, rar, tokenised CDN paths, or `gofile.io` "
+        "links. I'll download them all in parallel, extract every "
+        "Netscape cookie, and send the results back as a single "
+        "zip.\n\n"
         "At any time you can send /cancel to abort."
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)

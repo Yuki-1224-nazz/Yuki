@@ -356,80 +356,79 @@ async def _do_download(
     total_bytes_all = 0
     total_cookies_all = 0
     total_sets_all = 0
-    results_to_send: list[tuple[Path, int, int, int]] = []
+    results_to_send: list[tuple[Path, int, int, int, str]] = []
     workdirs: list[Path] = []
 
-    for file_idx, rf in enumerate(resolved):
-        file_label = rf.filename or f"file {file_idx + 1}"
-        file_started = time.time()
-
-        def _make_progress(label: str, fidx: int):
-            def _post_progress(read: int, total: Optional[int]) -> None:
-                prefix = f"[{fidx + 1}/{total_files}] {label}\n" if total_files > 1 else ""
-                body = (
-                    f"{prefix}⏳ Downloading...\n"
-                    f"{_progress_bar(read, total, file_started)}\n"
-                    f"⏱️ Elapsed: {int(time.time() - started)}s"
-                )
-                loop = asyncio.get_running_loop()
-                asyncio.run_coroutine_threadsafe(_edit(body), loop)
-            return _post_progress
-
-        def _make_status(label: str, fidx: int):
-            def _post_status(line: str) -> None:
-                prefix = f"[{fidx + 1}/{total_files}] {label}\n" if total_files > 1 else ""
-                elapsed = int(time.time() - started)
-                body = f"{prefix}{line}\n⏱️ Elapsed: {elapsed}s"
-                loop = asyncio.get_running_loop()
-                asyncio.run_coroutine_threadsafe(_edit(body), loop)
-            return _post_status
-
-        workdir = Path(tempfile.mkdtemp(prefix="logs2cookie-"))
-        workdirs.append(workdir)
-
-        try:
-            result = await async_run_pipeline(
-                rf.url,
-                workdir,
-                password=password,
-                keywords=keywords,
-                max_bytes=MAX_DOWNLOAD_BYTES,
-                on_status=_make_status(file_label, file_idx),
-                on_progress=_make_progress(file_label, file_idx),
-                extra_headers=rf.headers,
-            )
-        except Exception as exc:
-            log.exception("pipeline failed for %s (%s)", rf.url, file_label)
-            await _edit(
-                f"❌ Error processing {file_label}: {exc}"
-            )
-            continue
-
-        total_bytes_all += result.bytes_read
-
-        if result.cookie_count == 0:
-            if total_files == 1:
-                elapsed = int(time.time() - started)
-                speed = result.bytes_read / (time.time() - started) if (time.time() - started) > 0 else 0
-                await _edit(
-                    "ℹ️ Done — no matching cookies found.\n"
-                    f"📡 Read: {_human_bytes(result.bytes_read)} "
-                    f"({_human_speed(speed)})\n"
-                    f"⏱️ Elapsed: {elapsed}s"
-                )
-            continue
-
-        total_cookies_all += result.cookie_count
-        total_sets_all += len(result.cookie_files)
-        results_to_send.append((
-            result.zip_path,
-            len(result.cookie_files),
-            result.cookie_count,
-            result.bytes_read,
-        ))
-
-    # ---- Send results ----
     try:
+        for file_idx, rf in enumerate(resolved):
+            file_label = rf.filename or f"file {file_idx + 1}"
+            file_started = time.time()
+
+            def _make_progress(label: str, fidx: int, fstart: float):
+                def _post_progress(read: int, total: Optional[int]) -> None:
+                    prefix = f"[{fidx + 1}/{total_files}] {label}\n" if total_files > 1 else ""
+                    body = (
+                        f"{prefix}⏳ Downloading...\n"
+                        f"{_progress_bar(read, total, fstart)}\n"
+                        f"⏱️ Elapsed: {int(time.time() - started)}s"
+                    )
+                    loop = asyncio.get_running_loop()
+                    asyncio.run_coroutine_threadsafe(_edit(body), loop)
+                return _post_progress
+
+            def _make_status(label: str, fidx: int):
+                def _post_status(line: str) -> None:
+                    prefix = f"[{fidx + 1}/{total_files}] {label}\n" if total_files > 1 else ""
+                    elapsed = int(time.time() - started)
+                    body = f"{prefix}{line}\n⏱️ Elapsed: {elapsed}s"
+                    loop = asyncio.get_running_loop()
+                    asyncio.run_coroutine_threadsafe(_edit(body), loop)
+                return _post_status
+
+            workdir = Path(tempfile.mkdtemp(prefix="logs2cookie-"))
+            workdirs.append(workdir)
+
+            try:
+                result = await async_run_pipeline(
+                    rf.url,
+                    workdir,
+                    password=password,
+                    keywords=keywords,
+                    max_bytes=MAX_DOWNLOAD_BYTES,
+                    on_status=_make_status(file_label, file_idx),
+                    on_progress=_make_progress(file_label, file_idx, file_started),
+                    extra_headers=rf.headers,
+                )
+            except Exception as exc:
+                log.exception("pipeline failed for %s (%s)", rf.url, file_label)
+                await _edit(f"❌ Error processing {file_label}: {exc}")
+                continue
+
+            total_bytes_all += result.bytes_read
+
+            if result.cookie_count == 0:
+                if total_files == 1:
+                    elapsed = int(time.time() - started)
+                    speed = result.bytes_read / (time.time() - started) if (time.time() - started) > 0 else 0
+                    await _edit(
+                        "ℹ️ Done — no matching cookies found.\n"
+                        f"📡 Read: {_human_bytes(result.bytes_read)} "
+                        f"({_human_speed(speed)})\n"
+                        f"⏱️ Elapsed: {elapsed}s"
+                    )
+                continue
+
+            total_cookies_all += result.cookie_count
+            total_sets_all += len(result.cookie_files)
+            results_to_send.append((
+                result.zip_path,
+                len(result.cookie_files),
+                result.cookie_count,
+                result.bytes_read,
+                file_label,
+            ))
+
+        # ---- Send results ----
         elapsed = int(time.time() - started)
         speed = total_bytes_all / (time.time() - started) if (time.time() - started) > 0 else 0
 
@@ -444,9 +443,8 @@ async def _do_download(
                 )
             return
 
-        for i, (zip_path, sets, cookies, bread) in enumerate(results_to_send):
+        for i, (zip_path, sets, cookies, bread, label) in enumerate(results_to_send):
             zip_size = zip_path.stat().st_size
-            label = resolved[i].filename or f"file {i + 1}"
 
             if zip_size > DOC_UPLOAD_LIMIT:
                 await _edit(

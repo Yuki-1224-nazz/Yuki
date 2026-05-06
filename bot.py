@@ -65,6 +65,7 @@ DOC_UPLOAD_LIMIT = int(os.getenv("DOC_UPLOAD_LIMIT", str(50 * 1024 * 1024)))
 MAX_DOWNLOAD_BYTES = int(
     os.getenv("MAX_DOWNLOAD_BYTES", str(5 * 1024 * 1024 * 1024))
 )
+DOWNLOAD_CONNECTIONS = int(os.getenv("DOWNLOAD_CONNECTIONS", "8"))
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +326,7 @@ async def _run_job(
                 max_bytes=MAX_DOWNLOAD_BYTES,
                 on_status=_post_status,
                 on_progress=_post_progress,
+                num_connections=DOWNLOAD_CONNECTIONS,
             )
         except Exception as exc:
             log.exception("pipeline failed for %s", url)
@@ -456,10 +458,12 @@ def _check_extractor_binaries() -> None:
 def main() -> None:
     app = build_app()
     log.info(
-        "logs-to-cookie bot starting (admins=%s, doc_limit=%s, max_dl=%s)",
+        "logs-to-cookie bot starting (admins=%s, doc_limit=%s, max_dl=%s, "
+        "connections=%d)",
         ADMIN_IDS or "<everyone>",
         _human_bytes(DOC_UPLOAD_LIMIT),
         _human_bytes(MAX_DOWNLOAD_BYTES),
+        DOWNLOAD_CONNECTIONS,
     )
     _check_extractor_binaries()
     app.run_polling(allowed_updates=Update.ALL_TYPES)

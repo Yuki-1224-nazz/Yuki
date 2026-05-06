@@ -166,6 +166,7 @@ async def async_run_pipeline(
     max_bytes: Optional[int] = None,
     on_status: Optional[StatusCallback] = None,
     on_progress: Optional[ProgressCallback] = None,
+    num_connections: int = 8,
 ) -> PipelineResult:
     """Async version of run_pipeline — uses aiohttp for faster downloads.
 
@@ -203,6 +204,7 @@ async def async_run_pipeline(
         download_path,
         max_bytes=max_bytes,
         on_progress=on_progress,
+        num_connections=num_connections,
     )
     result.bytes_read = bytes_read
 

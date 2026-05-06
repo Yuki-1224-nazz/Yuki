@@ -111,7 +111,9 @@ async def async_download_to_file(
                     async with session.get(url, allow_redirects=True) as resp:
                         if resp.status == 416:
                             log.info("range not satisfiable — file already complete")
-                            break
+                            if on_progress is not None:
+                                on_progress(written, total)
+                            return written
 
                         if written > 0 and resp.status != 206:
                             log.warning(

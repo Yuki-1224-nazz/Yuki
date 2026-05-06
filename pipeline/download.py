@@ -58,6 +58,7 @@ async def async_download_to_file(
     max_bytes: Optional[int] = None,
     on_progress: Optional[ProgressCallback] = None,
     progress_interval: float = 0.5,
+    extra_headers: Optional[dict[str, str]] = None,
 ) -> int:
     """Async download using aiohttp for maximum speed.
 
@@ -88,16 +89,20 @@ async def async_download_to_file(
         for attempt in range(1, MAX_RETRIES + 1):
             written = 0
             try:
+                req_headers: dict[str, str] = {
+                    "User-Agent": DEFAULT_USER_AGENT,
+                    "Accept": "*/*",
+                    "Accept-Encoding": "identity",
+                    "Connection": "keep-alive",
+                }
+                if extra_headers:
+                    req_headers.update(extra_headers)
+
                 async with aiohttp.ClientSession(
                     connector=connector,
                     connector_owner=False,
                     timeout=timeout,
-                    headers={
-                        "User-Agent": DEFAULT_USER_AGENT,
-                        "Accept": "*/*",
-                        "Accept-Encoding": "identity",
-                        "Connection": "keep-alive",
-                    },
+                    headers=req_headers,
                 ) as session:
                     async with session.get(url, allow_redirects=True) as resp:
                         if resp.status >= 400:

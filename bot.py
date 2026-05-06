@@ -52,6 +52,12 @@ from telegram.ext import (
 
 from pipeline import async_run_pipeline
 from pipeline.archive import SEVENZIP_BINARIES
+from pipeline.resolvers import (
+    SUPPORTED_HOSTS,
+    ResolveError,
+    is_hosted_link,
+    resolve_url,
+)
 
 load_dotenv()
 
@@ -179,13 +185,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
 
     context.user_data.clear()
+    hosts = ", ".join(f"`{h}`" for h in SUPPORTED_HOSTS)
     text = (
         "👋 *logs-to-cookie* — Netscape cookie converter\n\n"
-        "Send me a *direct download URL* to your logs. I accept any "
-        "`http(s)` link — zip, 7z, rar, or even tokenised CDN paths "
-        "that don't end in `.zip`/`.7z`/`.rar`. I'll stream it, "
-        "extract every Netscape cookie I can find, and send each "
-        "cookie set back as its own `.txt` file inside a single zip.\n\n"
+        "Send me a *download URL* to your logs. I accept:\n"
+        f"• File hosting links: {hosts}\n"
+        "• Any direct `http(s)` download link\n"
+        "• zip, 7z, rar archives\n\n"
+        "I'll download it, extract every Netscape cookie I can find, "
+        "and send each cookie set back as a `.txt` file in a zip.\n\n"
         "At any time you can send /cancel to abort."
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
@@ -307,7 +315,7 @@ async def _do_download(
 
     status_msg = await context.bot.send_message(
         chat_id=chat_id,
-        text="⏳ Downloading... (initializing)",
+        text="⏳ Resolving link...",
     )
 
     last_text = ""
@@ -324,93 +332,164 @@ async def _do_download(
             except Exception:
                 pass
 
-    def _post_status(line: str) -> None:
-        elapsed = int(time.time() - started)
-        body = f"{line}\n⏱️ Elapsed: {elapsed}s"
-        loop = asyncio.get_running_loop()
-        asyncio.run_coroutine_threadsafe(_edit(body), loop)
-
-    def _post_progress(read: int, total: Optional[int]) -> None:
-        body = (
-            "⏳ Downloading...\n"
-            f"{_progress_bar(read, total, started)}\n"
-            f"⏱️ Elapsed: {int(time.time() - started)}s"
-        )
-        loop = asyncio.get_running_loop()
-        asyncio.run_coroutine_threadsafe(_edit(body), loop)
-
-    workdir = Path(tempfile.mkdtemp(prefix="logs2cookie-"))
+    # ---- Resolve hosted link to direct URL(s) ----
     try:
+        resolved = await resolve_url(url, password=password)
+    except ResolveError as exc:
+        await _edit(f"❌ {exc}")
+        return
+    except Exception as exc:
+        log.exception("resolve failed for %s", url)
+        await _edit(f"❌ Failed to resolve link: {exc}")
+        return
+
+    total_files = len(resolved)
+    if total_files > 1:
+        names = "\n".join(
+            f"  • {r.filename or r.url.split('/')[-1]}" for r in resolved
+        )
+        await _edit(f"📂 Found {total_files} files:\n{names}\n\n⏳ Downloading...")
+    else:
+        await _edit("⏳ Downloading... (initializing)")
+
+    # ---- Process each resolved file ----
+    total_bytes_all = 0
+    total_cookies_all = 0
+    total_sets_all = 0
+    results_to_send: list[tuple[Path, int, int, int]] = []
+    workdirs: list[Path] = []
+
+    for file_idx, rf in enumerate(resolved):
+        file_label = rf.filename or f"file {file_idx + 1}"
+        file_started = time.time()
+
+        def _make_progress(label: str, fidx: int):
+            def _post_progress(read: int, total: Optional[int]) -> None:
+                prefix = f"[{fidx + 1}/{total_files}] {label}\n" if total_files > 1 else ""
+                body = (
+                    f"{prefix}⏳ Downloading...\n"
+                    f"{_progress_bar(read, total, file_started)}\n"
+                    f"⏱️ Elapsed: {int(time.time() - started)}s"
+                )
+                loop = asyncio.get_running_loop()
+                asyncio.run_coroutine_threadsafe(_edit(body), loop)
+            return _post_progress
+
+        def _make_status(label: str, fidx: int):
+            def _post_status(line: str) -> None:
+                prefix = f"[{fidx + 1}/{total_files}] {label}\n" if total_files > 1 else ""
+                elapsed = int(time.time() - started)
+                body = f"{prefix}{line}\n⏱️ Elapsed: {elapsed}s"
+                loop = asyncio.get_running_loop()
+                asyncio.run_coroutine_threadsafe(_edit(body), loop)
+            return _post_status
+
+        workdir = Path(tempfile.mkdtemp(prefix="logs2cookie-"))
+        workdirs.append(workdir)
+
         try:
             result = await async_run_pipeline(
-                url,
+                rf.url,
                 workdir,
                 password=password,
                 keywords=keywords,
                 max_bytes=MAX_DOWNLOAD_BYTES,
-                on_status=_post_status,
-                on_progress=_post_progress,
+                on_status=_make_status(file_label, file_idx),
+                on_progress=_make_progress(file_label, file_idx),
+                extra_headers=rf.headers,
             )
         except Exception as exc:
-            log.exception("pipeline failed for %s", url)
-            await _edit(f"❌ Error: {exc}")
-            return
+            log.exception("pipeline failed for %s (%s)", rf.url, file_label)
+            await _edit(
+                f"❌ Error processing {file_label}: {exc}"
+            )
+            continue
 
-        elapsed = int(time.time() - started)
-        speed = result.bytes_read / (time.time() - started) if (time.time() - started) > 0 else 0
+        total_bytes_all += result.bytes_read
 
         if result.cookie_count == 0:
+            if total_files == 1:
+                elapsed = int(time.time() - started)
+                speed = result.bytes_read / (time.time() - started) if (time.time() - started) > 0 else 0
+                await _edit(
+                    "ℹ️ Done — no matching cookies found.\n"
+                    f"📡 Read: {_human_bytes(result.bytes_read)} "
+                    f"({_human_speed(speed)})\n"
+                    f"⏱️ Elapsed: {elapsed}s"
+                )
+            continue
+
+        total_cookies_all += result.cookie_count
+        total_sets_all += len(result.cookie_files)
+        results_to_send.append((
+            result.zip_path,
+            len(result.cookie_files),
+            result.cookie_count,
+            result.bytes_read,
+        ))
+
+    # ---- Send results ----
+    try:
+        elapsed = int(time.time() - started)
+        speed = total_bytes_all / (time.time() - started) if (time.time() - started) > 0 else 0
+
+        if not results_to_send:
+            if total_cookies_all == 0 and total_files > 1:
+                await _edit(
+                    f"ℹ️ Done — processed {total_files} files, "
+                    "no matching cookies found.\n"
+                    f"📡 Read: {_human_bytes(total_bytes_all)} "
+                    f"({_human_speed(speed)})\n"
+                    f"⏱️ Elapsed: {elapsed}s"
+                )
+            return
+
+        for i, (zip_path, sets, cookies, bread) in enumerate(results_to_send):
+            zip_size = zip_path.stat().st_size
+            label = resolved[i].filename or f"file {i + 1}"
+
+            if zip_size > DOC_UPLOAD_LIMIT:
+                await _edit(
+                    f"❌ Result zip for {label} is too large for Telegram "
+                    f"({_human_bytes(zip_size)} > "
+                    f"{_human_bytes(DOC_UPLOAD_LIMIT)}).\n"
+                    f"📦 {sets} cookie set(s) — {cookies} cookies\n"
+                    "Tip: re-run with a stricter keyword filter."
+                )
+                continue
+
+            prefix = f"[{i + 1}/{len(results_to_send)}] " if len(results_to_send) > 1 else ""
             await _edit(
-                "ℹ️ Done — no matching cookies found.\n"
-                f"📡 Read: {_human_bytes(result.bytes_read)} "
-                f"({_human_speed(speed)})\n"
+                f"{prefix}📤 Uploading result...\n"
+                f"📦 {sets} cookie set(s) — {cookies} cookies\n"
+                f"📡 zip: {_human_bytes(zip_size)}\n"
                 f"⏱️ Elapsed: {elapsed}s"
             )
-            return
-
-        zip_size = result.zip_path.stat().st_size
-
-        if zip_size > DOC_UPLOAD_LIMIT:
-            await _edit(
-                f"❌ Result zip is too large for Telegram "
-                f"({_human_bytes(zip_size)} > "
-                f"{_human_bytes(DOC_UPLOAD_LIMIT)}).\n"
-                f"📦 {len(result.cookie_files)} cookie set(s) — "
-                f"{result.cookie_count} cookies\n"
-                "Tip: re-run with a stricter keyword filter to shrink "
-                "the result."
-            )
-            return
+            with open(zip_path, "rb") as f:
+                await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=f,
+                    filename=zip_path.name,
+                    caption=(
+                        f"{prefix}✅ {sets} cookie set(s) — "
+                        f"{cookies} cookies\n"
+                        f"📡 read: {_human_bytes(bread)} "
+                        f"({_human_speed(speed)})\n"
+                        f"⏱️ {elapsed}s"
+                    ),
+                )
 
         await _edit(
-            "📤 Uploading result...\n"
-            f"📦 {len(result.cookie_files)} cookie set(s) — "
-            f"{result.cookie_count} cookies\n"
-            f"📡 zip: {_human_bytes(zip_size)}\n"
-            f"⏱️ Elapsed: {elapsed}s"
-        )
-        with open(result.zip_path, "rb") as f:
-            await context.bot.send_document(
-                chat_id=chat_id,
-                document=f,
-                filename=result.zip_path.name,
-                caption=(
-                    f"✅ {len(result.cookie_files)} cookie set(s) — "
-                    f"{result.cookie_count} cookies\n"
-                    f"📡 read: {_human_bytes(result.bytes_read)} "
-                    f"({_human_speed(speed)})\n"
-                    f"⏱️ {elapsed}s"
-                ),
-            )
-        await _edit(
-            f"✅ Done! Sent {_human_bytes(zip_size)} "
-            f"({len(result.cookie_files)} sets, "
-            f"{result.cookie_count} cookies).\n"
+            f"✅ Done! {total_sets_all} set(s), "
+            f"{total_cookies_all} cookies from "
+            f"{total_files} file(s).\n"
+            f"📡 Total: {_human_bytes(total_bytes_all)}\n"
             f"⚡ Avg speed: {_human_speed(speed)}"
         )
     finally:
         context.user_data.clear()
-        shutil.rmtree(workdir, ignore_errors=True)
+        for wd in workdirs:
+            shutil.rmtree(wd, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------

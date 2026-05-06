@@ -5,10 +5,11 @@ archives never need to fit in RAM. Supports both async (aiohttp) and
 sync (requests) download paths. The async path is preferred for speed
 as it avoids blocking the event loop and supports concurrent I/O.
 
-Speed optimizations over the original implementation:
-- Chunk size increased from 64 KB to 512 KB for better throughput
+Speed & reliability optimizations:
+- Chunk size of 1 MB for maximum throughput
 - Async aiohttp downloads with TCP connection reuse
-- Automatic retry with exponential backoff for transient failures
+- Automatic retry with exponential backoff — only for connection-phase
+  errors (never re-downloads data that was already written)
 - Optimized file I/O with larger write buffers
 """
 
@@ -25,10 +26,10 @@ import requests
 
 log = logging.getLogger(__name__)
 
-CHUNK_SIZE = 512 * 1024  # 512 KB — 8x larger for better throughput
-DEFAULT_TIMEOUT = (15, 600)  # (connect, read) — faster connect timeout
+CHUNK_SIZE = 1024 * 1024  # 1 MB for maximum throughput
+DEFAULT_TIMEOUT = (15, 600)  # (connect, read)
 DEFAULT_USER_AGENT = (
-    "logs-to-cookie/2.1 (+https://github.com/Yuki-1224-nazz/Yuki)"
+    "logs-to-cookie/2.2 (+https://github.com/Yuki-1224-nazz/Yuki)"
 )
 MAX_RETRIES = 3
 RETRY_BACKOFF_BASE = 1.5  # seconds
@@ -58,9 +59,13 @@ async def async_download_to_file(
     on_progress: Optional[ProgressCallback] = None,
     progress_interval: float = 0.5,
 ) -> int:
-    """Async download using aiohttp — much faster than blocking requests.
+    """Async download using aiohttp for maximum speed.
 
-    Uses 512 KB chunks, TCP keepalive, and automatic retries.
+    Uses 1 MB chunks, TCP keepalive, and automatic retries for
+    connection-phase errors only. Once data starts streaming, any
+    failure is raised immediately (no re-download of already-written
+    data).
+
     Returns bytes written. Raises DownloadError on failure.
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -68,10 +73,10 @@ async def async_download_to_file(
     timeout = aiohttp.ClientTimeout(
         total=None,
         connect=15,
-        sock_read=120,
+        sock_read=300,
     )
     connector = aiohttp.TCPConnector(
-        limit=4,
+        limit=8,
         ttl_dns_cache=300,
         enable_cleanup_closed=True,
         force_close=False,
@@ -112,7 +117,7 @@ async def async_download_to_file(
                         written = 0
                         last_emit = 0.0
 
-                        with open(dest, "wb", buffering=1024 * 1024) as f:
+                        with open(dest, "wb", buffering=2 * 1024 * 1024) as f:
                             async for chunk in resp.content.iter_chunked(
                                 CHUNK_SIZE
                             ):
@@ -140,6 +145,11 @@ async def async_download_to_file(
             except DownloadError:
                 raise
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                if written > 0:
+                    raise DownloadError(
+                        f"download failed after receiving "
+                        f"{written} bytes: {exc}"
+                    ) from exc
                 last_exc = exc
                 if attempt < MAX_RETRIES:
                     wait = RETRY_BACKOFF_BASE ** attempt
@@ -200,12 +210,13 @@ def download_to_file(
     progress_interval: float = 0.5,
     session: Optional[requests.Session] = None,
 ) -> int:
-    """Stream ``url`` to ``dest`` in 512 KB chunks.
+    """Stream ``url`` to ``dest`` in 1 MB chunks.
 
     Returns the number of bytes written. Raises :class:`DownloadError`
     on transport failures or if the response exceeds ``max_bytes``.
 
-    Includes retry logic for transient network errors.
+    Only retries connection-phase errors; once data starts streaming,
+    failures are raised immediately to avoid re-downloading.
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
 
@@ -228,7 +239,7 @@ def download_to_file(
             written = 0
             last_emit = 0.0
             try:
-                with open(dest, "wb", buffering=1024 * 1024) as f:
+                with open(dest, "wb", buffering=2 * 1024 * 1024) as f:
                     for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
                         if not chunk:
                             continue
@@ -271,6 +282,11 @@ def download_to_file(
                     f"{last_exc}"
                 ) from last_exc
         except (requests.RequestException, OSError) as exc:
+            if written > 0:
+                raise DownloadError(
+                    f"download failed after receiving "
+                    f"{written} bytes: {exc}"
+                ) from exc
             last_exc = exc
             if attempt < MAX_RETRIES:
                 wait = RETRY_BACKOFF_BASE ** attempt

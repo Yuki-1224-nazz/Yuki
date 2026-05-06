@@ -33,6 +33,7 @@ import os
 import shutil
 import tempfile
 import time
+from collections import defaultdict
 from pathlib import Path
 from typing import Optional, Sequence
 from urllib.parse import urlparse
@@ -92,6 +93,8 @@ def _parse_admins(raw: str) -> set[int]:
 
 
 ADMIN_IDS: set[int] = _parse_admins(os.getenv("ADMIN_IDS", ""))
+
+_active_jobs: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 
 def _is_admin(update: Update) -> bool:
@@ -278,6 +281,28 @@ async def _run_job(
     password: Optional[str] = context.user_data.get("password")
     keywords: Sequence[str] = context.user_data.get("keywords") or []
     chat_id = update.effective_chat.id
+
+    lock = _active_jobs[chat_id]
+    if lock.locked():
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="⏳ A download is already in progress. Wait for it to "
+            "finish or send /cancel.",
+        )
+        return
+
+    async with lock:
+        await _do_download(update, context, url, password, keywords, chat_id)
+
+
+async def _do_download(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    url: str,
+    password: Optional[str],
+    keywords: Sequence[str],
+    chat_id: int,
+) -> None:
     started = time.time()
 
     status_msg = await context.bot.send_message(
@@ -424,6 +449,7 @@ def build_app() -> Application:
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
         name="logs2cookie_conv",
         persistent=False,
+        conversation_timeout=600,
     )
 
     app.add_handler(conv)

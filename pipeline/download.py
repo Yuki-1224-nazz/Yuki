@@ -75,82 +75,86 @@ async def async_download_to_file(
 
     last_exc: Optional[Exception] = None
 
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            async with aiohttp.ClientSession(
-                connector=connector,
-                timeout=timeout,
-                headers={
-                    "User-Agent": DEFAULT_USER_AGENT,
-                    "Accept": "*/*",
-                    "Accept-Encoding": "identity",
-                    "Connection": "keep-alive",
-                },
-            ) as session:
-                async with session.get(url, allow_redirects=True) as resp:
-                    if resp.status >= 400:
-                        raise DownloadError(
-                            f"HTTP {resp.status} for {url}"
-                        )
-
-                    total: Optional[int] = None
-                    cl = resp.headers.get("Content-Length")
-                    if cl and cl.isdigit():
-                        total = int(cl)
-                        if max_bytes is not None and total > max_bytes:
+    try:
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                async with aiohttp.ClientSession(
+                    connector=connector,
+                    connector_owner=False,
+                    timeout=timeout,
+                    headers={
+                        "User-Agent": DEFAULT_USER_AGENT,
+                        "Accept": "*/*",
+                        "Accept-Encoding": "identity",
+                        "Connection": "keep-alive",
+                    },
+                ) as session:
+                    async with session.get(url, allow_redirects=True) as resp:
+                        if resp.status >= 400:
                             raise DownloadError(
-                                f"file is {total} bytes, larger than "
-                                f"max ({max_bytes})"
+                                f"HTTP {resp.status} for {url}"
                             )
 
-                    written = 0
-                    last_emit = 0.0
-
-                    with open(dest, "wb", buffering=1024 * 1024) as f:
-                        async for chunk in resp.content.iter_chunked(
-                            CHUNK_SIZE
-                        ):
-                            if not chunk:
-                                continue
-                            f.write(chunk)
-                            written += len(chunk)
-
-                            if max_bytes is not None and written > max_bytes:
+                        total: Optional[int] = None
+                        cl = resp.headers.get("Content-Length")
+                        if cl and cl.isdigit():
+                            total = int(cl)
+                            if max_bytes is not None and total > max_bytes:
                                 raise DownloadError(
-                                    f"download exceeded max_bytes "
-                                    f"({max_bytes})"
+                                    f"file is {total} bytes, larger than "
+                                    f"max ({max_bytes})"
                                 )
 
-                            if on_progress is not None:
-                                now = time.time()
-                                if now - last_emit >= progress_interval:
-                                    on_progress(written, total)
-                                    last_emit = now
+                        written = 0
+                        last_emit = 0.0
 
-            if on_progress is not None:
-                on_progress(written, total)
-            return written
+                        with open(dest, "wb", buffering=1024 * 1024) as f:
+                            async for chunk in resp.content.iter_chunked(
+                                CHUNK_SIZE
+                            ):
+                                if not chunk:
+                                    continue
+                                f.write(chunk)
+                                written += len(chunk)
 
-        except DownloadError:
-            raise
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
-            last_exc = exc
-            if attempt < MAX_RETRIES:
-                wait = RETRY_BACKOFF_BASE ** attempt
-                log.warning(
-                    "download attempt %d/%d failed (%s), "
-                    "retrying in %.1fs...",
-                    attempt,
-                    MAX_RETRIES,
-                    exc,
-                    wait,
-                )
-                await asyncio.sleep(wait)
-            else:
-                raise DownloadError(
-                    f"download failed after {MAX_RETRIES} attempts: "
-                    f"{last_exc}"
-                ) from last_exc
+                                if max_bytes is not None and written > max_bytes:
+                                    raise DownloadError(
+                                        f"download exceeded max_bytes "
+                                        f"({max_bytes})"
+                                    )
+
+                                if on_progress is not None:
+                                    now = time.time()
+                                    if now - last_emit >= progress_interval:
+                                        on_progress(written, total)
+                                        last_emit = now
+
+                if on_progress is not None:
+                    on_progress(written, total)
+                return written
+
+            except DownloadError:
+                raise
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                last_exc = exc
+                if attempt < MAX_RETRIES:
+                    wait = RETRY_BACKOFF_BASE ** attempt
+                    log.warning(
+                        "download attempt %d/%d failed (%s), "
+                        "retrying in %.1fs...",
+                        attempt,
+                        MAX_RETRIES,
+                        exc,
+                        wait,
+                    )
+                    await asyncio.sleep(wait)
+                else:
+                    raise DownloadError(
+                        f"download failed after {MAX_RETRIES} attempts: "
+                        f"{last_exc}"
+                    ) from last_exc
+    finally:
+        await connector.close()
 
     raise DownloadError("download failed (unreachable)")
 

@@ -30,10 +30,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import platform
 import shutil
 import tempfile
 import time
 import zipfile
+from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Sequence
 from urllib.parse import urlparse
@@ -67,6 +70,34 @@ MAX_DOWNLOAD_BYTES = int(
     os.getenv("MAX_DOWNLOAD_BYTES", str(5 * 1024 * 1024 * 1024))
 )
 DOWNLOAD_CONNECTIONS = int(os.getenv("DOWNLOAD_CONNECTIONS", "16"))
+
+BOT_VERSION = "2.2.0"
+_BOOT_TIME = time.time()
+
+
+# ---------------------------------------------------------------------------
+# Job history tracking
+# ---------------------------------------------------------------------------
+@dataclass
+class JobRecord:
+    """Lightweight record of a completed or failed job."""
+    user_id: int
+    username: str
+    urls: list[str]
+    cookie_count: int
+    bytes_read: int
+    elapsed: int
+    status: str  # "success" | "partial" | "failed" | "no_cookies"
+    timestamp: float = field(default_factory=time.time)
+
+
+_job_history: deque[JobRecord] = deque(maxlen=50)
+
+
+# ---------------------------------------------------------------------------
+# Per-user active job tracking
+# ---------------------------------------------------------------------------
+_active_jobs: dict[int, str] = {}  # user_id -> status description
 
 
 # ---------------------------------------------------------------------------
@@ -346,8 +377,12 @@ async def _run_job(
     passwords = passwords[: len(urls)]
     keywords: Sequence[str] = context.user_data.get("keywords") or []
     chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    username = update.effective_user.username or str(user_id)
     started = time.time()
     num_urls = len(urls)
+
+    _active_jobs[user_id] = f"Downloading {num_urls} link{'s' if num_urls > 1 else ''}..."
 
     status_msg = await context.bot.send_message(
         chat_id=chat_id,
@@ -420,6 +455,8 @@ async def _run_job(
         tasks = [_run_one(i, u, passwords[i]) for i, u in enumerate(urls)]
         raw_results = await asyncio.gather(*tasks)
 
+        _active_jobs[user_id] = "Processing results..."
+
         # Merge results
         from pipeline.pipeline import PipelineResult
         total_bytes_read = 0
@@ -449,6 +486,11 @@ async def _run_job(
         if errors and not all_cookie_files:
             error_text = "\n".join(errors)
             await _edit(f"❌ All downloads failed:\n{error_text}")
+            _job_history.append(JobRecord(
+                user_id=user_id, username=username, urls=urls,
+                cookie_count=0, bytes_read=0,
+                elapsed=int(time.time() - started), status="failed",
+            ))
             return
 
         if errors:
@@ -466,6 +508,11 @@ async def _run_job(
                 f"({_human_speed(speed)})\n"
                 f"⏱️ Elapsed: {elapsed}s"
             )
+            _job_history.append(JobRecord(
+                user_id=user_id, username=username, urls=urls,
+                cookie_count=0, bytes_read=total_bytes_read,
+                elapsed=elapsed, status="no_cookies",
+            ))
             return
 
         # Zip merged results
@@ -516,9 +563,134 @@ async def _run_job(
             f"{total_cookie_count} cookies).\n"
             f"⚡ Avg speed: {_human_speed(speed)}"
         )
+        job_status = "success" if not errors else "partial"
+        _job_history.append(JobRecord(
+            user_id=user_id, username=username, urls=urls,
+            cookie_count=total_cookie_count, bytes_read=total_bytes_read,
+            elapsed=elapsed, status=job_status,
+        ))
     finally:
+        _active_jobs.pop(user_id, None)
         context.user_data.clear()
         shutil.rmtree(workdir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Utility commands
+# ---------------------------------------------------------------------------
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show current job status for the requesting user."""
+    if not _is_admin(update):
+        return
+    user_id = update.effective_user.id
+    job_status = _active_jobs.get(user_id)
+    if job_status:
+        await update.message.reply_text(
+            f"\U0001f504 *Active job:* {job_status}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    else:
+        await update.message.reply_text("\u2705 No active job running.")
+
+
+async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show current bot configuration."""
+    if not _is_admin(update):
+        return
+    sevenzip = shutil.which("7z") or shutil.which("7za") or "not found"
+    text = (
+        "\u2699\ufe0f *Bot Settings*\n\n"
+        f"\u2022 Max download size: `{_human_bytes(MAX_DOWNLOAD_BYTES)}`\n"
+        f"\u2022 Upload limit: `{_human_bytes(DOC_UPLOAD_LIMIT)}`\n"
+        f"\u2022 Download connections: `{DOWNLOAD_CONNECTIONS}`\n"
+        f"\u2022 Admin IDs: `{', '.join(str(i) for i in ADMIN_IDS) or 'everyone'}`\n"
+        f"\u2022 7z binary: `{sevenzip}`\n"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show recent job history."""
+    if not _is_admin(update):
+        return
+    if not _job_history:
+        await update.message.reply_text("\U0001f4cb No jobs recorded yet.")
+        return
+
+    lines: list[str] = ["\U0001f4cb *Recent Jobs*\n"]
+    for i, job in enumerate(reversed(list(_job_history)), start=1):
+        ts = time.strftime("%Y-%m-%d %H:%M", time.gmtime(job.timestamp))
+        icon = {
+            "success": "\u2705",
+            "partial": "\u26a0\ufe0f",
+            "failed": "\u274c",
+            "no_cookies": "\u2139\ufe0f",
+        }.get(job.status, "\u2022")
+        links_label = f"{len(job.urls)} link{'s' if len(job.urls) > 1 else ''}"
+        lines.append(
+            f"{i}\\. {icon} `{ts}` \u2014 {links_label}, "
+            f"{job.cookie_count} cookies, {_human_bytes(job.bytes_read)}, "
+            f"{job.elapsed}s ({job.status})"
+        )
+        if i >= 10:
+            remaining = len(_job_history) - 10
+            if remaining > 0:
+                lines.append(f"\n_\\.\\.\\.\\. and {remaining} older job(s)_")
+            break
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2,
+    )
+
+
+async def cmd_connections(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """View or set the number of parallel download connections."""
+    global DOWNLOAD_CONNECTIONS
+    if not _is_admin(update):
+        return
+    args = context.args
+    if args and args[0].isdigit():
+        new_val = max(1, min(64, int(args[0])))
+        DOWNLOAD_CONNECTIONS = new_val
+        await update.message.reply_text(
+            f"\u2705 Download connections set to `{new_val}`.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    else:
+        await update.message.reply_text(
+            f"\U0001f310 Current download connections: `{DOWNLOAD_CONNECTIONS}`\n"
+            "Usage: `/connections <number>` (1\u201364)",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+
+async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show bot version and uptime."""
+    if not _is_admin(update):
+        return
+    uptime_secs = int(time.time() - _BOOT_TIME)
+    hours, remainder = divmod(uptime_secs, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours > 0:
+        uptime_str = f"{hours}h {minutes}m {secs}s"
+    elif minutes > 0:
+        uptime_str = f"{minutes}m {secs}s"
+    else:
+        uptime_str = f"{secs}s"
+
+    jobs_total = len(_job_history)
+    jobs_ok = sum(1 for j in _job_history if j.status == "success")
+
+    text = (
+        "\u2139\ufe0f *Bot Info*\n\n"
+        f"\u2022 Version: `{BOT_VERSION}`\n"
+        f"\u2022 Python: `{platform.python_version()}`\n"
+        f"\u2022 Uptime: `{uptime_str}`\n"
+        f"\u2022 Jobs this session: `{jobs_total}` ({jobs_ok} successful)\n"
+        f"\u2022 OS: `{platform.system()} {platform.release()}`\n"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 
 # ---------------------------------------------------------------------------
@@ -561,6 +733,11 @@ def build_app() -> Application:
 
     app.add_handler(conv)
     app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("settings", cmd_settings))
+    app.add_handler(CommandHandler("history", cmd_history))
+    app.add_handler(CommandHandler("connections", cmd_connections))
+    app.add_handler(CommandHandler("info", cmd_info))
     return app
 
 

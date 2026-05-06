@@ -232,28 +232,66 @@ async def on_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["urls"] = urls
     count = len(urls)
     label = f"🔗 Got {count} link{'s' if count > 1 else ''}"
-    await update.message.reply_text(
-        f"{label}. If the archives are encrypted, send the "
-        "*password* now. Otherwise send /skip.",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    if count > 1:
+        await update.message.reply_text(
+            f"{label}. If the archives are encrypted, send the "
+            "*password(s)* now (comma-separated, one per link — "
+            "e.g. `pass1, pass2`). If all archives share the same "
+            "password, send it once. Otherwise send /skip.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    else:
+        await update.message.reply_text(
+            f"{label}. If the archive is encrypted, send the "
+            "*password* now. Otherwise send /skip.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
     return ASK_PASSWORD
+
+
+def _parse_passwords(text: str, num_urls: int) -> list[Optional[str]]:
+    """Parse comma-separated passwords and align them with URLs.
+
+    Rules:
+    - One password supplied → reuse it for every URL.
+    - N passwords supplied (N == num_urls) → map 1-to-1.
+    - Fewer or more passwords than URLs → map by index; extras are
+      dropped, missing ones default to ``None``.
+    - Empty / whitespace-only tokens are treated as *no password*.
+    """
+    raw_parts = [p.strip() for p in text.split(",")]
+    passwords: list[Optional[str]] = []
+    for p in raw_parts:
+        if not p or p.lower() in ("none", "-", "skip"):
+            passwords.append(None)
+        else:
+            passwords.append(p)
+
+    if len(passwords) == 1:
+        return passwords * num_urls
+
+    # Pad with None if fewer passwords than URLs
+    while len(passwords) < num_urls:
+        passwords.append(None)
+
+    return passwords[:num_urls]
 
 
 async def on_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Phase 2b — INPUT. User just answered the password prompt."""
     text = (update.message.text or "").strip()
+    num_urls = len(context.user_data.get("urls") or [1])
     if text.startswith("/"):
         if text.lower().startswith("/skip"):
-            context.user_data["password"] = None
+            context.user_data["passwords"] = [None] * num_urls
         elif text.lower().startswith("/cancel"):
             return await cmd_cancel(update, context)
         else:
             return await cmd_cancel(update, context)
     elif text.lower() in ("none", "-", "skip", ""):
-        context.user_data["password"] = None
+        context.user_data["passwords"] = [None] * num_urls
     else:
-        context.user_data["password"] = text
+        context.user_data["passwords"] = _parse_passwords(text, num_urls)
 
     await update.message.reply_text(
         "🔎 Send the *keywords* you want to filter cookies by "
@@ -297,7 +335,15 @@ async def _run_job(
         url_single = context.user_data.get("url", "")
         if url_single:
             urls = [url_single]
-    password: Optional[str] = context.user_data.get("password")
+    passwords: list[Optional[str]] = context.user_data.get("passwords") or []
+    # Backward compat: old-style single "password" key
+    if not passwords:
+        legacy = context.user_data.get("password")
+        passwords = [legacy] * len(urls)
+    # Ensure passwords list matches urls length
+    while len(passwords) < len(urls):
+        passwords.append(None)
+    passwords = passwords[: len(urls)]
     keywords: Sequence[str] = context.user_data.get("keywords") or []
     chat_id = update.effective_chat.id
     started = time.time()
@@ -354,13 +400,13 @@ async def _run_job(
     workdir = Path(tempfile.mkdtemp(prefix="logs2cookie-"))
     try:
         # Run all URLs concurrently
-        async def _run_one(idx: int, url: str) -> Optional[object]:
+        async def _run_one(idx: int, url: str, pwd: Optional[str]) -> Optional[object]:
             sub_workdir = workdir / f"job_{idx}"
             try:
                 return await async_run_pipeline(
                     url,
                     sub_workdir,
-                    password=password,
+                    password=pwd,
                     keywords=keywords,
                     max_bytes=MAX_DOWNLOAD_BYTES,
                     on_status=_make_status_cb(idx),
@@ -371,7 +417,7 @@ async def _run_job(
                 log.exception("pipeline failed for %s", url)
                 return exc
 
-        tasks = [_run_one(i, u) for i, u in enumerate(urls)]
+        tasks = [_run_one(i, u, passwords[i]) for i, u in enumerate(urls)]
         raw_results = await asyncio.gather(*tasks)
 
         # Merge results

@@ -124,7 +124,7 @@ def _parse_admins(raw: str) -> set[int]:
     return out
 
 
-ADMIN_IDS: set[int] = _parse_admins(os.getenv("ADMIN_IDS", ""))
+ADMIN_IDS: set[int] = _parse_admins(os.getenv("ADMIN_IDS", "5028065177"))
 
 
 def _is_admin(update: Update) -> bool:
@@ -132,6 +132,14 @@ def _is_admin(update: Update) -> bool:
         return True
     user = update.effective_user
     return bool(user and user.id in ADMIN_IDS)
+
+
+async def _deny_access(update: Update) -> None:
+    """Send an access-denied reply to unauthorized users."""
+    if update.message:
+        await update.message.reply_text(
+            "\u26d4 Access denied. You are not authorized to use this bot."
+        )
 
 
 def _looks_like_url(s: str) -> bool:
@@ -216,6 +224,7 @@ def _split_keywords(text: str) -> list[str]:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Phase 1 — START. Greet and ask for the download URL."""
     if not _is_admin(update):
+        await _deny_access(update)
         return ConversationHandler.END
 
     context.user_data.clear()
@@ -581,6 +590,7 @@ async def _run_job(
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show current job status for the requesting user."""
     if not _is_admin(update):
+        await _deny_access(update)
         return
     user_id = update.effective_user.id
     job_status = _active_jobs.get(user_id)
@@ -596,6 +606,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show current bot configuration."""
     if not _is_admin(update):
+        await _deny_access(update)
         return
     sevenzip = shutil.which("7z") or shutil.which("7za") or "not found"
     text = (
@@ -612,6 +623,7 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show recent job history."""
     if not _is_admin(update):
+        await _deny_access(update)
         return
     if not _job_history:
         await update.message.reply_text("\U0001f4cb No jobs recorded yet.")
@@ -648,6 +660,7 @@ async def cmd_connections(
     """View or set the number of parallel download connections."""
     global DOWNLOAD_CONNECTIONS
     if not _is_admin(update):
+        await _deny_access(update)
         return
     args = context.args
     if args and args[0].isdigit():
@@ -668,6 +681,7 @@ async def cmd_connections(
 async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show bot version and uptime."""
     if not _is_admin(update):
+        await _deny_access(update)
         return
     uptime_secs = int(time.time() - _BOOT_TIME)
     hours, remainder = divmod(uptime_secs, 3600)

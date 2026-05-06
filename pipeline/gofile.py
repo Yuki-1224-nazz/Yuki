@@ -13,6 +13,7 @@ URLs that the download engine can stream.  The flow:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import re
@@ -58,12 +59,33 @@ class GofileFile:
 
 
 async def _create_guest_account(session: aiohttp.ClientSession) -> str:
-    """Create a throwaway guest account and return the token."""
-    async with session.post(f"{GOFILE_API}/accounts") as resp:
-        data = await resp.json()
-    if data.get("status") != "ok":
+    """Create a throwaway guest account with retry for rate limits."""
+
+    for attempt in range(5):
+        try:
+            async with session.post(
+                f"{GOFILE_API}/accounts", timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                data = await resp.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            if attempt < 4:
+                wait = 2 ** (attempt + 1)
+                log.warning("gofile account creation attempt %d failed: %s, retrying in %ds", attempt + 1, exc, wait)
+                await asyncio.sleep(wait)
+                continue
+            raise GofileError(f"gofile API unreachable after 5 attempts: {exc}") from exc
+
+        if data.get("status") == "ok":
+            return data["data"]["token"]
+        if data.get("status") == "error-rateLimit":
+            if attempt < 4:
+                wait = 2 ** (attempt + 1)
+                log.warning("gofile rate limited, retrying in %ds...", wait)
+                await asyncio.sleep(wait)
+                continue
+            raise GofileError("gofile API rate limit — try again in a few minutes")
         raise GofileError(f"failed to create guest account: {data}")
-    return data["data"]["token"]
+    raise GofileError("gofile account creation failed (unreachable)")
 
 
 async def _get_website_token(session: aiohttp.ClientSession) -> str:
@@ -106,14 +128,23 @@ async def resolve_gofile_url(
             ).hexdigest()
 
         async with session.get(
-            api_url, headers=headers, params=params
+            api_url,
+            headers=headers,
+            params=params,
+            timeout=aiohttp.ClientTimeout(total=30),
         ) as resp:
             data = await resp.json()
 
-        if data.get("status") != "ok":
+        status = data.get("status", "unknown")
+        if status != "ok":
+            if status == "error-notPremium":
+                raise GofileError(
+                    "gofile API requires a premium account for "
+                    "content listing — the free guest API may have "
+                    "changed. Check gofile.io/api for updates."
+                )
             raise GofileError(
-                f"gofile API error for {content_id}: "
-                f"{data.get('status', 'unknown')}"
+                f"gofile API error for {content_id}: {status}"
             )
 
         contents = data.get("data", {}).get("children", {})

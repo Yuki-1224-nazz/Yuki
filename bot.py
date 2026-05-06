@@ -60,7 +60,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("logs-to-cookie.bot")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8661120242:AAEO3UUHVKrcQha_XCGsVA0tJJq3qy5_8YQ").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 DOC_UPLOAD_LIMIT = int(os.getenv("DOC_UPLOAD_LIMIT", str(50 * 1024 * 1024)))
 MAX_DOWNLOAD_BYTES = int(
     os.getenv("MAX_DOWNLOAD_BYTES", str(5 * 1024 * 1024 * 1024))

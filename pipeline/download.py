@@ -37,6 +37,10 @@ RETRY_BACKOFF_BASE = 1.5  # seconds
 class DownloadError(RuntimeError):
     """Raised when the download fails for any reason."""
 
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
 
 ProgressCallback = Callable[[int, Optional[int]], None]
 """``progress(bytes_read, total_bytes_or_None)``."""
@@ -179,7 +183,7 @@ def _open_stream(
     try:
         resp = sess.get(url, stream=True, timeout=timeout, allow_redirects=True)
     except requests.RequestException as exc:
-        raise DownloadError(f"network error: {exc}") from exc
+        raise DownloadError(f"network error: {exc}", retryable=True) from exc
 
     if resp.status_code >= 400:
         resp.close()
@@ -246,8 +250,26 @@ def download_to_file(
                 on_progress(written, total)
             return written
 
-        except DownloadError:
-            raise
+        except DownloadError as exc:
+            if not exc.retryable:
+                raise
+            last_exc = exc
+            if attempt < MAX_RETRIES:
+                wait = RETRY_BACKOFF_BASE ** attempt
+                log.warning(
+                    "download attempt %d/%d failed (%s), "
+                    "retrying in %.1fs...",
+                    attempt,
+                    MAX_RETRIES,
+                    exc,
+                    wait,
+                )
+                time.sleep(wait)
+            else:
+                raise DownloadError(
+                    f"download failed after {MAX_RETRIES} attempts: "
+                    f"{last_exc}"
+                ) from last_exc
         except (requests.RequestException, OSError) as exc:
             last_exc = exc
             if attempt < MAX_RETRIES:

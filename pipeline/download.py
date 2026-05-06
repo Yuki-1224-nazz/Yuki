@@ -327,25 +327,25 @@ async def async_download_to_file(
                             if cl_raw and cl_raw.isdigit()
                             else None
                         )
-                        accept_ranges = (
-                            resp.headers.get("Accept-Ranges", "").lower()
-                        )
-
                         if max_bytes is not None and content_length and content_length > max_bytes:
                             raise DownloadError(
                                 f"file is {content_length} bytes, larger "
                                 f"than max ({max_bytes})"
                             )
 
+                        # Try multi-conn whenever Content-Length is
+                        # known and large enough.  Some servers return
+                        # Accept-Ranges: none in the initial GET but
+                        # actually honour Range requests, so we don't
+                        # gate on that header — the fallback in
+                        # _multi_conn_download handles real failures.
                         can_multiconn = (
-                            accept_ranges == "bytes"
-                            and content_length is not None
+                            content_length is not None
                             and content_length >= MIN_SEGMENT_SIZE
                             and num_connections > 1
                         )
 
                         if not can_multiconn:
-                            # Stream directly from this response
                             log.info(
                                 "single-connection download (%s bytes)",
                                 content_length or "unknown",
@@ -359,10 +359,9 @@ async def async_download_to_file(
                                 progress_interval=progress_interval,
                             )
 
-                    # Response closed here — switch to multi-conn
+                    # Response closed — try multi-conn
                     log.info(
-                        "server supports Range — using %d connections "
-                        "for %d bytes",
+                        "trying %d parallel connections for %d bytes",
                         num_connections,
                         content_length,
                     )

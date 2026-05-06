@@ -443,6 +443,7 @@ async def _do_download(
                 )
             return
 
+        sent_count = 0
         for i, (zip_path, sets, cookies, bread, label) in enumerate(results_to_send):
             zip_size = zip_path.stat().st_size
 
@@ -476,14 +477,23 @@ async def _do_download(
                         f"⏱️ {elapsed}s"
                     ),
                 )
+            sent_count += 1
 
-        await _edit(
-            f"✅ Done! {total_sets_all} set(s), "
-            f"{total_cookies_all} cookies from "
-            f"{total_files} file(s).\n"
-            f"📡 Total: {_human_bytes(total_bytes_all)}\n"
-            f"⚡ Avg speed: {_human_speed(speed)}"
-        )
+        if sent_count == 0:
+            await _edit(
+                f"❌ Found {total_cookies_all} cookies in "
+                f"{total_sets_all} set(s), but all result zips exceeded "
+                f"Telegram's {_human_bytes(DOC_UPLOAD_LIMIT)} upload limit.\n"
+                "Tip: re-run with a stricter keyword filter."
+            )
+        else:
+            await _edit(
+                f"✅ Done! {total_sets_all} set(s), "
+                f"{total_cookies_all} cookies from "
+                f"{total_files} file(s).\n"
+                f"📡 Total: {_human_bytes(total_bytes_all)}\n"
+                f"⚡ Avg speed: {_human_speed(speed)}"
+            )
     finally:
         context.user_data.clear()
         for wd in workdirs:

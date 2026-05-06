@@ -55,7 +55,7 @@ def _host_matches(url: str, *patterns: str) -> bool:
     except ValueError:
         return False
     host = host.lower()
-    return any(p in host for p in patterns)
+    return any(host == p or host.endswith("." + p) for p in patterns)
 
 
 # ---------------------------------------------------------------------------

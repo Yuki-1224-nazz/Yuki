@@ -250,6 +250,12 @@ async def _parallel_download(
 
         total_written = sum(results)
 
+        if total_written != file_size:
+            raise DownloadError(
+                f"parallel download incomplete: got {total_written} bytes, "
+                f"expected {file_size}"
+            )
+
         with open(dest, "wb", buffering=2 * 1024 * 1024) as out:
             for idx in range(n_conn):
                 seg_file = dest.parent / f"{dest.name}.part{idx}"

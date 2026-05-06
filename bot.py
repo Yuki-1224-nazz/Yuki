@@ -188,11 +188,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     hosts = ", ".join(f"`{h}`" for h in SUPPORTED_HOSTS)
     text = (
         "👋 *logs-to-cookie* — Netscape cookie converter\n\n"
-        "Send me a *download URL* to your logs. I accept:\n"
+        "Send me *download URL(s)* to your logs. I accept:\n"
         f"• File hosting links: {hosts}\n"
         "• Any direct `http(s)` download link\n"
         "• zip, 7z, rar archives\n\n"
-        "I'll download it, extract every Netscape cookie I can find, "
+        "💡 *Multiple links:* Send several URLs in one message "
+        "(one per line or space-separated) to batch-process them all.\n\n"
+        "I'll download, extract every Netscape cookie I can find, "
         "and send each cookie set back as a `.txt` file in a zip.\n\n"
         "At any time you can send /cancel to abort."
     )
@@ -211,22 +213,37 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
+def _extract_urls(text: str) -> list[str]:
+    """Extract all valid URLs from a message (newline or space separated)."""
+    urls: list[str] = []
+    for token in text.replace("\n", " ").split():
+        token = token.strip().rstrip(",;")
+        if _looks_like_url(token):
+            urls.append(token)
+    return urls
+
+
 async def on_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Phase 2a — INPUT. User just sent the download URL."""
+    """Phase 2a — INPUT. User just sent the download URL(s)."""
     text = (update.message.text or "").strip()
     if text.startswith("/"):
         return await cmd_cancel(update, context)
-    if not _looks_like_url(text):
+
+    urls = _extract_urls(text)
+    if not urls:
         await update.message.reply_text(
             "That doesn't look like an `http(s)` URL. "
-            "Send the direct download URL again, or /cancel.",
+            "Send the direct download URL(s) again, or /cancel.\n\n"
+            "💡 You can send multiple links at once — "
+            "one per line or space-separated.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return ASK_URL
 
-    context.user_data["url"] = text
+    context.user_data["urls"] = urls
+    count_msg = f"🔗 Got {len(urls)} link(s)." if len(urls) > 1 else "🔗 Got the link."
     await update.message.reply_text(
-        "🔐 Got the link. If the archive is encrypted, send the "
+        f"{count_msg} If the archive(s) are encrypted, send the "
         "*password* now. Otherwise send /skip.",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -285,7 +302,11 @@ async def _run_job(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    url: str = context.user_data.get("url", "")
+    urls: list[str] = context.user_data.get("urls") or []
+    if not urls:
+        url = context.user_data.get("url", "")
+        if url:
+            urls = [url]
     password: Optional[str] = context.user_data.get("password")
     keywords: Sequence[str] = context.user_data.get("keywords") or []
     chat_id = update.effective_chat.id
@@ -300,22 +321,24 @@ async def _run_job(
         return
 
     async with lock:
-        await _do_download(update, context, url, password, keywords, chat_id)
+        await _do_download(update, context, urls, password, keywords, chat_id)
 
 
 async def _do_download(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-    url: str,
+    urls: list[str],
     password: Optional[str],
     keywords: Sequence[str],
     chat_id: int,
 ) -> None:
     started = time.time()
+    total_url_count = len(urls)
 
     status_msg = await context.bot.send_message(
         chat_id=chat_id,
-        text="⏳ Resolving link...",
+        text=f"⏳ Resolving {total_url_count} link(s)..."
+        if total_url_count > 1 else "⏳ Resolving link...",
     )
 
     last_text = ""
@@ -332,21 +355,40 @@ async def _do_download(
             except Exception:
                 pass
 
-    # ---- Resolve hosted link to direct URL(s) ----
-    try:
-        resolved = await resolve_url(url, password=password)
-    except ResolveError as exc:
-        await _edit(f"❌ {exc}")
-        return
-    except Exception as exc:
-        log.exception("resolve failed for %s", url)
-        await _edit(f"❌ Failed to resolve link: {exc}")
+    # ---- Resolve all links to direct URL(s) ----
+    all_resolved: list[tuple[str, list]] = []
+    for url_idx, url in enumerate(urls):
+        url_label = f"[{url_idx + 1}/{total_url_count}] " if total_url_count > 1 else ""
+        await _edit(f"{url_label}⏳ Resolving link...")
+        try:
+            resolved = await resolve_url(url, password=password)
+            all_resolved.append((url, resolved))
+        except ResolveError as exc:
+            await _edit(f"{url_label}❌ {exc}")
+            if total_url_count == 1:
+                return
+            continue
+        except Exception as exc:
+            log.exception("resolve failed for %s", url)
+            await _edit(f"{url_label}❌ Failed to resolve link: {exc}")
+            if total_url_count == 1:
+                return
+            continue
+
+    if not all_resolved:
+        await _edit("❌ All links failed to resolve.")
         return
 
-    total_files = len(resolved)
+    # Flatten all resolved files into a single list
+    flat_resolved = []
+    for url, resolved_files in all_resolved:
+        for rf in resolved_files:
+            flat_resolved.append(rf)
+
+    total_files = len(flat_resolved)
     if total_files > 1:
         names = "\n".join(
-            f"  • {r.filename or r.url.split('/')[-1]}" for r in resolved
+            f"  • {r.filename or r.url.split('/')[-1]}" for r in flat_resolved
         )
         await _edit(f"📂 Found {total_files} files:\n{names}\n\n⏳ Downloading...")
     else:
@@ -360,7 +402,7 @@ async def _do_download(
     workdirs: list[Path] = []
 
     try:
-        for file_idx, rf in enumerate(resolved):
+        for file_idx, rf in enumerate(flat_resolved):
             file_label = rf.filename or f"file {file_idx + 1}"
             file_started = time.time()
 
@@ -536,12 +578,28 @@ def build_app() -> Application:
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
         name="logs2cookie_conv",
         persistent=False,
-        conversation_timeout=600,
+        conversation_timeout=1800,
     )
 
     app.add_handler(conv)
     app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_error_handler(_error_handler)
     return app
+
+
+async def _error_handler(
+    update: object, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Global error handler — log the error and notify the user."""
+    log.exception("unhandled exception:", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_chat:
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="❌ An unexpected error occurred. Please try again with /start.",
+            )
+        except Exception:
+            pass
 
 
 def _check_extractor_binaries() -> None:

@@ -220,6 +220,12 @@ async def async_run_pipeline(
             None, lambda: extract_archive(download_path, extracted, password=password)
         )
 
+        # Free disk space — the archive is no longer needed after extraction
+        try:
+            download_path.unlink()
+        except OSError:
+            pass
+
         status("⚙ Processing... (scanning extracted files)")
         sources = await loop.run_in_executor(None, lambda: _find_cookie_files(extracted))
 

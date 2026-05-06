@@ -5,17 +5,23 @@ archives never need to fit in RAM. Supports both async (aiohttp) and
 sync (requests) download paths. The async path is preferred for speed
 as it avoids blocking the event loop and supports concurrent I/O.
 
-Speed optimizations over the original implementation:
-- Chunk size increased from 64 KB to 512 KB for better throughput
+Speed optimizations:
+- 1 MB chunks for maximum throughput per read syscall
 - Async aiohttp downloads with TCP connection reuse
 - Automatic retry with exponential backoff for transient failures
-- Optimized file I/O with larger write buffers
+- 2 MB write buffers for fast disk I/O
+- **Multi-connection parallel downloading** via HTTP Range requests
+  when the server supports it (up to 10x faster on CDNs / cloud storage)
+- Zero-probe design: starts downloading immediately, checks response
+  headers to decide whether to switch to multi-connection mode
+- Graceful fallback to single-connection when Range fails at runtime
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Callable, Iterator, Optional
@@ -25,13 +31,15 @@ import requests
 
 log = logging.getLogger(__name__)
 
-CHUNK_SIZE = 512 * 1024  # 512 KB — 8x larger for better throughput
+CHUNK_SIZE = 1024 * 1024  # 1 MB — maximises throughput per read syscall
 DEFAULT_TIMEOUT = (15, 600)  # (connect, read) — faster connect timeout
 DEFAULT_USER_AGENT = (
     "logs-to-cookie/2.1 (+https://github.com/Yuki-1224-nazz/Yuki)"
 )
 MAX_RETRIES = 3
 RETRY_BACKOFF_BASE = 1.5  # seconds
+DEFAULT_CONNECTIONS = int(os.getenv("DOWNLOAD_CONNECTIONS", "16"))
+MIN_SEGMENT_SIZE = 2 * 1024 * 1024  # 2 MB — no point splitting smaller
 
 
 class DownloadError(RuntimeError):
@@ -42,6 +50,10 @@ class DownloadError(RuntimeError):
         self.retryable = retryable
 
 
+class _RangeNotSupported(Exception):
+    """Internal signal: server rejected a Range request at runtime."""
+
+
 ProgressCallback = Callable[[int, Optional[int]], None]
 """``progress(bytes_read, total_bytes_or_None)``."""
 
@@ -50,6 +62,223 @@ ProgressCallback = Callable[[int, Optional[int]], None]
 # Async download (preferred path — used by the bot)
 # ---------------------------------------------------------------------------
 
+def _make_connector(num_connections: int) -> aiohttp.TCPConnector:
+    return aiohttp.TCPConnector(
+        limit=max(num_connections + 2, 10),
+        ttl_dns_cache=300,
+        enable_cleanup_closed=True,
+        force_close=False,
+    )
+
+
+def _make_timeout() -> aiohttp.ClientTimeout:
+    return aiohttp.ClientTimeout(total=None, connect=15, sock_read=120)
+
+
+_COMMON_HEADERS = {
+    "User-Agent": DEFAULT_USER_AGENT,
+    "Accept": "*/*",
+    "Accept-Encoding": "identity",
+    "Connection": "keep-alive",
+}
+
+
+async def _download_segment(
+    session: aiohttp.ClientSession,
+    url: str,
+    dest: Path,
+    start: int,
+    end: int,
+    segment_id: int,
+    progress: list[int],
+    progress_lock: asyncio.Lock,
+) -> int:
+    """Download a byte-range segment to a temp file with retry."""
+    seg_path = dest.parent / f"{dest.name}.part{segment_id}"
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            written = 0
+            async with session.get(
+                url,
+                headers={"Range": f"bytes={start}-{end}"},
+                allow_redirects=True,
+            ) as resp:
+                if resp.status in (200, 206):
+                    pass
+                elif resp.status in (416, 501, 503):
+                    raise _RangeNotSupported(
+                        f"HTTP {resp.status} for Range request"
+                    )
+                elif resp.status >= 400:
+                    raise _RangeNotSupported(
+                        f"HTTP {resp.status} for segment {segment_id}"
+                    )
+                with open(seg_path, "wb", buffering=1024 * 1024) as f:
+                    async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
+                        if not chunk:
+                            continue
+                        f.write(chunk)
+                        written += len(chunk)
+                        async with progress_lock:
+                            progress[segment_id] = written
+            return written
+        except _RangeNotSupported:
+            raise
+        except DownloadError:
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+            if attempt < MAX_RETRIES:
+                await asyncio.sleep(RETRY_BACKOFF_BASE ** attempt)
+            else:
+                raise DownloadError(
+                    f"segment {segment_id} failed after {MAX_RETRIES} "
+                    f"attempts: {exc}"
+                ) from exc
+    raise DownloadError(f"segment {segment_id} failed (unreachable)")
+
+
+def _assemble_segments_sync(dest: Path, num_segments: int) -> int:
+    """Concatenate segment files into the final destination."""
+    total = 0
+    with open(dest, "wb", buffering=4 * 1024 * 1024) as out:
+        for i in range(num_segments):
+            seg = dest.parent / f"{dest.name}.part{i}"
+            if not seg.exists():
+                continue
+            with open(seg, "rb", buffering=4 * 1024 * 1024) as inp:
+                while True:
+                    buf = inp.read(4 * 1024 * 1024)
+                    if not buf:
+                        break
+                    out.write(buf)
+                    total += len(buf)
+            seg.unlink(missing_ok=True)
+    return total
+
+
+def _cleanup_segments(dest: Path, num_segments: int) -> None:
+    """Remove leftover .partN files after a failed multi-conn attempt."""
+    for i in range(num_segments):
+        seg = dest.parent / f"{dest.name}.part{i}"
+        seg.unlink(missing_ok=True)
+
+
+async def _multi_conn_download(
+    session: aiohttp.ClientSession,
+    url: str,
+    dest: Path,
+    total_size: int,
+    *,
+    num_connections: int,
+    max_bytes: Optional[int],
+    on_progress: Optional[ProgressCallback],
+    progress_interval: float,
+) -> int:
+    """Download using multiple parallel Range-request connections.
+
+    Raises ``_RangeNotSupported`` if any segment gets a non-206
+    response so the caller can fall back to single-connection.
+    """
+    if max_bytes is not None and total_size > max_bytes:
+        raise DownloadError(
+            f"file is {total_size} bytes, larger than max ({max_bytes})"
+        )
+
+    seg_size = total_size // num_connections
+    if seg_size < MIN_SEGMENT_SIZE:
+        num_connections = max(1, total_size // MIN_SEGMENT_SIZE)
+        seg_size = total_size // num_connections if num_connections > 0 else total_size
+    if num_connections <= 1:
+        num_connections = 1
+
+    segments: list[tuple[int, int]] = []
+    for i in range(num_connections):
+        start = i * seg_size
+        end = (i + 1) * seg_size - 1 if i < num_connections - 1 else total_size - 1
+        segments.append((start, end))
+
+    log.info(
+        "multi-connection download: %d segments, %d bytes each, total %d",
+        num_connections, seg_size, total_size,
+    )
+
+    progress: list[int] = [0] * num_connections
+    progress_lock = asyncio.Lock()
+
+    progress_done = asyncio.Event()
+
+    async def _report_progress() -> None:
+        last_emit = 0.0
+        while not progress_done.is_set():
+            await asyncio.sleep(progress_interval)
+            if on_progress is not None:
+                now = time.time()
+                if now - last_emit >= progress_interval:
+                    async with progress_lock:
+                        total_read = sum(progress)
+                    on_progress(total_read, total_size)
+                    last_emit = now
+
+    reporter = asyncio.create_task(_report_progress()) if on_progress else None
+
+    try:
+        tasks = [
+            _download_segment(
+                session, url, dest, start, end, i, progress, progress_lock,
+            )
+            for i, (start, end) in enumerate(segments)
+        ]
+        await asyncio.gather(*tasks)
+    except _RangeNotSupported:
+        _cleanup_segments(dest, num_connections)
+        raise
+    finally:
+        progress_done.set()
+        if reporter is not None:
+            await reporter
+
+    written = await asyncio.get_running_loop().run_in_executor(
+        None, _assemble_segments_sync, dest, num_connections,
+    )
+
+    if on_progress is not None:
+        on_progress(written, total_size)
+
+    return written
+
+
+async def _stream_response(
+    resp: aiohttp.ClientResponse,
+    dest: Path,
+    *,
+    total: Optional[int],
+    max_bytes: Optional[int],
+    on_progress: Optional[ProgressCallback],
+    progress_interval: float,
+) -> int:
+    """Read an already-opened response to disk. Used by single-conn path."""
+    written = 0
+    last_emit = 0.0
+    with open(dest, "wb", buffering=2 * 1024 * 1024) as f:
+        async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
+            if not chunk:
+                continue
+            f.write(chunk)
+            written += len(chunk)
+            if max_bytes is not None and written > max_bytes:
+                raise DownloadError(
+                    f"download exceeded max_bytes ({max_bytes})"
+                )
+            if on_progress is not None:
+                now = time.time()
+                if now - last_emit >= progress_interval:
+                    on_progress(written, total)
+                    last_emit = now
+    if on_progress is not None:
+        on_progress(written, total)
+    return written
+
+
 async def async_download_to_file(
     url: str,
     dest: Path,
@@ -57,85 +286,127 @@ async def async_download_to_file(
     max_bytes: Optional[int] = None,
     on_progress: Optional[ProgressCallback] = None,
     progress_interval: float = 0.5,
+    num_connections: int = DEFAULT_CONNECTIONS,
+    extra_headers: Optional[dict[str, str]] = None,
 ) -> int:
-    """Async download using aiohttp — much faster than blocking requests.
+    """Async download with automatic multi-connection acceleration.
 
-    Uses 512 KB chunks, TCP keepalive, and automatic retries.
+    **Zero-probe design:** opens a single GET request immediately and
+    starts streaming. Checks the response headers (``Accept-Ranges``
+    and ``Content-Length``) to decide whether multi-connection mode is
+    viable. If so, closes the initial response and spawns parallel
+    Range-request connections. If the server rejects Range requests at
+    runtime, falls back to a fresh single-connection download.
+
+    Pass *extra_headers* to add custom headers (e.g. cookies for
+    authenticated downloads like gofile.io).
+
     Returns bytes written. Raises DownloadError on failure.
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
-
-    timeout = aiohttp.ClientTimeout(
-        total=None,
-        connect=15,
-        sock_read=120,
-    )
-    connector = aiohttp.TCPConnector(
-        limit=4,
-        ttl_dns_cache=300,
-        enable_cleanup_closed=True,
-        force_close=False,
-    )
+    connector = _make_connector(num_connections)
+    merged_headers = {**_COMMON_HEADERS, **(extra_headers or {})}
 
     last_exc: Optional[Exception] = None
-
     try:
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 async with aiohttp.ClientSession(
                     connector=connector,
                     connector_owner=False,
-                    timeout=timeout,
-                    headers={
-                        "User-Agent": DEFAULT_USER_AGENT,
-                        "Accept": "*/*",
-                        "Accept-Encoding": "identity",
-                        "Connection": "keep-alive",
-                    },
+                    timeout=_make_timeout(),
+                    headers=merged_headers,
                 ) as session:
-                    async with session.get(url, allow_redirects=True) as resp:
+                    # --- Start a normal GET immediately (no probe) ---
+                    async with session.get(
+                        url, allow_redirects=True
+                    ) as resp:
                         if resp.status >= 400:
                             raise DownloadError(
                                 f"HTTP {resp.status} for {url}"
                             )
 
-                        total: Optional[int] = None
-                        cl = resp.headers.get("Content-Length")
-                        if cl and cl.isdigit():
-                            total = int(cl)
-                            if max_bytes is not None and total > max_bytes:
+                        cl_raw = resp.headers.get("Content-Length")
+                        content_length = (
+                            int(cl_raw)
+                            if cl_raw and cl_raw.isdigit()
+                            else None
+                        )
+                        if max_bytes is not None and content_length and content_length > max_bytes:
+                            raise DownloadError(
+                                f"file is {content_length} bytes, larger "
+                                f"than max ({max_bytes})"
+                            )
+
+                        # Try multi-conn whenever Content-Length is
+                        # known and large enough.  Some servers return
+                        # Accept-Ranges: none in the initial GET but
+                        # actually honour Range requests, so we don't
+                        # gate on that header — the fallback in
+                        # _multi_conn_download handles real failures.
+                        can_multiconn = (
+                            content_length is not None
+                            and content_length >= MIN_SEGMENT_SIZE
+                            and num_connections > 1
+                        )
+
+                        if not can_multiconn:
+                            log.info(
+                                "single-connection download (%s bytes)",
+                                content_length or "unknown",
+                            )
+                            return await _stream_response(
+                                resp,
+                                dest,
+                                total=content_length,
+                                max_bytes=max_bytes,
+                                on_progress=on_progress,
+                                progress_interval=progress_interval,
+                            )
+
+                    # Response closed — try multi-conn
+                    log.info(
+                        "trying %d parallel connections for %d bytes",
+                        num_connections,
+                        content_length,
+                    )
+                    try:
+                        return await _multi_conn_download(
+                            session,
+                            url,
+                            dest,
+                            content_length,
+                            num_connections=num_connections,
+                            max_bytes=max_bytes,
+                            on_progress=on_progress,
+                            progress_interval=progress_interval,
+                        )
+                    except _RangeNotSupported as exc:
+                        log.warning(
+                            "multi-connection failed (%s) — falling back "
+                            "to single connection",
+                            exc,
+                        )
+                        # Fresh single-conn download
+                        async with session.get(
+                            url, allow_redirects=True
+                        ) as resp2:
+                            if resp2.status >= 400:
                                 raise DownloadError(
-                                    f"file is {total} bytes, larger than "
-                                    f"max ({max_bytes})"
+                                    f"HTTP {resp2.status} for {url}"
                                 )
-
-                        written = 0
-                        last_emit = 0.0
-
-                        with open(dest, "wb", buffering=1024 * 1024) as f:
-                            async for chunk in resp.content.iter_chunked(
-                                CHUNK_SIZE
-                            ):
-                                if not chunk:
-                                    continue
-                                f.write(chunk)
-                                written += len(chunk)
-
-                                if max_bytes is not None and written > max_bytes:
-                                    raise DownloadError(
-                                        f"download exceeded max_bytes "
-                                        f"({max_bytes})"
-                                    )
-
-                                if on_progress is not None:
-                                    now = time.time()
-                                    if now - last_emit >= progress_interval:
-                                        on_progress(written, total)
-                                        last_emit = now
-
-                if on_progress is not None:
-                    on_progress(written, total)
-                return written
+                            cl2 = resp2.headers.get("Content-Length")
+                            total2 = (
+                                int(cl2) if cl2 and cl2.isdigit() else None
+                            )
+                            return await _stream_response(
+                                resp2,
+                                dest,
+                                total=total2,
+                                max_bytes=max_bytes,
+                                on_progress=on_progress,
+                                progress_interval=progress_interval,
+                            )
 
             except DownloadError:
                 raise
@@ -200,7 +471,7 @@ def download_to_file(
     progress_interval: float = 0.5,
     session: Optional[requests.Session] = None,
 ) -> int:
-    """Stream ``url`` to ``dest`` in 512 KB chunks.
+    """Stream ``url`` to ``dest`` in 1 MB chunks.
 
     Returns the number of bytes written. Raises :class:`DownloadError`
     on transport failures or if the response exceeds ``max_bytes``.
@@ -228,7 +499,7 @@ def download_to_file(
             written = 0
             last_emit = 0.0
             try:
-                with open(dest, "wb", buffering=1024 * 1024) as f:
+                with open(dest, "wb", buffering=2 * 1024 * 1024) as f:
                     for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
                         if not chunk:
                             continue

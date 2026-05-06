@@ -7,10 +7,10 @@ disk.
 
 ```
 START      User sends /start
-INPUT       └─► Bot asks for direct download URL
+INPUT       └─► Bot asks for direct download URL(s)
                  └─► Bot asks for archive password (or /skip)
                       └─► Bot asks for keywords filter (or /skip)
-PROCESS              └─► Chunked download (64 KB at a time)
+PROCESS              └─► Multi-connection parallel download
                           └─► Parse & extract cookies
                                └─► Convert to Netscape format
                                     └─► One file per cookie set
@@ -26,8 +26,8 @@ FEEDBACK   ⏳ Downloading... ▓▓░░  ⚙ Processing...  🔄 Converting..
 
 | Phase | What happens |
 |---|---|
-| **START** | User sends `/start`. The bot greets them and asks for a *direct download URL* to the logs. |
-| **INPUT** | The bot collects three things in sequence: the URL, an archive password (skippable), and an optional keyword filter (skippable). |
+| **START** | User sends `/start`. The bot greets them and asks for one or more *direct download URLs* (comma or space separated). |
+| **INPUT** | The bot collects three things in sequence: the URL(s), an archive password (skippable), and an optional keyword filter (skippable). Multiple URLs are downloaded and processed in parallel. |
 | **PROCESS** | The bot streams the URL in 64 KB chunks to a temp file, then sniffs the first few bytes to detect zip/7z/rar (so tokenised CDN URLs without `.zip`/`.7z`/`.rar` in the path also work). Archives are extracted with the supplied password; every cookie file inside is parsed. Each detected *cookie set* (one per source file) is emitted as its own Netscape `.txt` file. |
 | **OUTPUT** | Every output `.txt` is bundled into `cookies_result.zip` and uploaded as a Telegram document. If the zip exceeds Telegram's 50 MB bot upload limit, the bot stops with a clear error and asks the user to re-run with a stricter keyword filter. |
 | **FEEDBACK** | The bot edits a single status message throughout: `⏳ Downloading...` with a progress bar, `⚙ Processing...`, `🔄 Converting...`, and finally `✅ Done!` or `❌ Error <reason>`. |
@@ -96,10 +96,11 @@ See [`.env.example`](.env.example) for the full list:
 - `ADMIN_IDS` — comma-separated allow-list of Telegram user IDs.
 - `DOC_UPLOAD_LIMIT` *(bytes, default 52428800)* — result zips larger than this make the bot stop with a clear error message instead of uploading.
 - `MAX_DOWNLOAD_BYTES` *(bytes, default 5368709120)* — refuses inputs larger than this.
+- `DOWNLOAD_CONNECTIONS` *(int, default 16)* — number of parallel HTTP connections used to download the file. The bot probes for `Accept-Ranges: bytes` support and, when the server allows it, splits the download into this many concurrent Range-request streams. Set to `1` to disable multi-connection downloading.
 
 ## How it works
 
-1. **Streaming.** `requests.get(stream=True)` pulls 64 KB at a time straight into a temp file on disk — the body is never buffered in RAM and the file is what we sniff for the archive type.
+1. **Streaming.** The async download path probes the server for HTTP Range support. When available, the file is split into segments downloaded in parallel across multiple connections (default 8) — this can push throughput well past what a single TCP stream achieves. Falls back to a single chunked stream when Range is not supported.
 2. **Line buffer.** Chunks are decoded as UTF-8 (errors replaced) and split on `\n`. Trailing partial lines are stitched onto the next chunk so cookie rows split across chunk boundaries are never lost.
 3. **Detection + extraction.** The first 8 bytes of the saved file are matched against ZIP (`PK\x03\x04` / `PK\x05\x06` / `PK\x07\x08`), 7Z (`7z\xbc\xaf\x27\x1c`) and RAR (`Rar!\x1a\x07`) signatures, so URLs like `https://cdn2.linkforge.xyz/download/AgAD0w22104` (no extension) work just fine. All three archive types are then unpacked with `7z x` — recent p7zip handles RAR4 and RAR5 natively, including encryption. The bot also tries `unrar x` as a last-resort fallback if 7z is unavailable. Either way it fails fast on a wrong password.
 4. **Parse.** Every line that matches the 7-column Netscape cookie format (`domain TAB flag TAB path TAB secure TAB expires TAB name TAB value`) is kept. Comments and malformed lines are silently dropped. The `#HttpOnly_` prefix is preserved on the domain column.

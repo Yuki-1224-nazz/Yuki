@@ -43,6 +43,7 @@ from .download import (
     async_download_to_file,
     download_to_file,
 )
+from .gofile import GofileError, is_gofile_url, resolve_gofile_url
 
 log = logging.getLogger(__name__)
 
@@ -166,6 +167,7 @@ async def async_run_pipeline(
     max_bytes: Optional[int] = None,
     on_status: Optional[StatusCallback] = None,
     on_progress: Optional[ProgressCallback] = None,
+    num_connections: int = 8,
 ) -> PipelineResult:
     """Async version of run_pipeline — uses aiohttp for faster downloads.
 
@@ -191,22 +193,49 @@ async def async_run_pipeline(
         output_dir=output_dir,
     )
 
-    # 1. Download (async, chunked)
-    status("⏳ Downloading...")
+    # 1. Resolve URL (gofile.io needs API calls to get direct links)
+    download_url = url
+    extra_headers: Optional[dict[str, str]] = None
+
+    if is_gofile_url(url):
+        status("🔗 Resolving gofile.io link...")
+        try:
+            gf_files = await resolve_gofile_url(url, password=password)
+        except GofileError as exc:
+            raise RuntimeError(f"gofile resolution failed: {exc}") from exc
+        # Use the first file (or the largest one for multi-file shares)
+        gf = max(gf_files, key=lambda f: f.size)
+        download_url = gf.url
+        extra_headers = {"Cookie": f"accountToken={gf.token}"}
+        log.info("gofile resolved: %s → %s (%d bytes)", url, gf.name, gf.size)
+        status(f"⏳ Downloading {gf.name}...")
+
+    # 2. Download (async, chunked)
+    if extra_headers is None:
+        status("⏳ Downloading...")
     suffix = next(
-        (s for s in ARCHIVE_SUFFIXES if url.lower().endswith(s)),
+        (s for s in ARCHIVE_SUFFIXES if download_url.lower().endswith(s)),
         "",
     )
+    if not suffix and is_gofile_url(url):
+        # Gofile URLs don't have file extensions in the path
+        gf_name = gf.name if is_gofile_url(url) else ""
+        suffix = next(
+            (s for s in ARCHIVE_SUFFIXES if gf_name.lower().endswith(s)),
+            "",
+        )
     download_path = workdir / f"input{suffix or '.bin'}"
     bytes_read = await async_download_to_file(
-        url,
+        download_url,
         download_path,
         max_bytes=max_bytes,
         on_progress=on_progress,
+        num_connections=num_connections,
+        extra_headers=extra_headers,
     )
     result.bytes_read = bytes_read
 
-    # 2. Detect archive type
+    # 3. Detect archive type
     kind = detect_archive_kind(download_path)
 
     if kind is not None:

@@ -33,6 +33,7 @@ import os
 import shutil
 import tempfile
 import time
+import zipfile
 from pathlib import Path
 from typing import Optional, Sequence
 from urllib.parse import urlparse
@@ -65,6 +66,7 @@ DOC_UPLOAD_LIMIT = int(os.getenv("DOC_UPLOAD_LIMIT", str(50 * 1024 * 1024)))
 MAX_DOWNLOAD_BYTES = int(
     os.getenv("MAX_DOWNLOAD_BYTES", str(5 * 1024 * 1024 * 1024))
 )
+DOWNLOAD_CONNECTIONS = int(os.getenv("DOWNLOAD_CONNECTIONS", "16"))
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +109,16 @@ def _looks_like_url(s: str) -> bool:
     except ValueError:
         return False
     return u.scheme in ("http", "https") and bool(u.netloc)
+
+
+def _extract_urls(text: str) -> list[str]:
+    """Extract all URLs from text (comma, space, or newline separated)."""
+    urls: list[str] = []
+    for part in text.replace(",", " ").split():
+        part = part.strip()
+        if _looks_like_url(part):
+            urls.append(part)
+    return urls
 
 
 def _human_bytes(n: int) -> str:
@@ -178,11 +190,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     text = (
         "👋 *logs-to-cookie* — Netscape cookie converter\n\n"
-        "Send me a *direct download URL* to your logs. I accept any "
-        "`http(s)` link — zip, 7z, rar, or even tokenised CDN paths "
-        "that don't end in `.zip`/`.7z`/`.rar`. I'll stream it, "
-        "extract every Netscape cookie I can find, and send each "
-        "cookie set back as its own `.txt` file inside a single zip.\n\n"
+        "Send me one or more *direct download URLs* to your logs "
+        "(comma or space separated). I accept any `http(s)` link "
+        "— zip, 7z, rar, tokenised CDN paths, or `gofile.io` "
+        "links. I'll download them all in parallel, extract every "
+        "Netscape cookie, and send the results back as a single "
+        "zip.\n\n"
         "At any time you can send /cancel to abort."
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
@@ -201,21 +214,26 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def on_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Phase 2a — INPUT. User just sent the download URL."""
+    """Phase 2a — INPUT. User just sent the download URL(s)."""
     text = (update.message.text or "").strip()
     if text.startswith("/"):
         return await cmd_cancel(update, context)
-    if not _looks_like_url(text):
+
+    urls = _extract_urls(text)
+    if not urls:
         await update.message.reply_text(
-            "That doesn't look like an `http(s)` URL. "
-            "Send the direct download URL again, or /cancel.",
+            "No valid `http(s)` URL found. "
+            "Send one or more direct download URLs (comma or space "
+            "separated), or /cancel.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return ASK_URL
 
-    context.user_data["url"] = text
+    context.user_data["urls"] = urls
+    count = len(urls)
+    label = f"🔗 Got {count} link{'s' if count > 1 else ''}"
     await update.message.reply_text(
-        "🔐 Got the link. If the archive is encrypted, send the "
+        f"{label}. If the archives are encrypted, send the "
         "*password* now. Otherwise send /skip.",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -274,15 +292,20 @@ async def _run_job(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    url: str = context.user_data.get("url", "")
+    urls: list[str] = context.user_data.get("urls") or []
+    if not urls:
+        url_single = context.user_data.get("url", "")
+        if url_single:
+            urls = [url_single]
     password: Optional[str] = context.user_data.get("password")
     keywords: Sequence[str] = context.user_data.get("keywords") or []
     chat_id = update.effective_chat.id
     started = time.time()
+    num_urls = len(urls)
 
     status_msg = await context.bot.send_message(
         chat_id=chat_id,
-        text="⏳ Downloading... (initializing)",
+        text=f"⏳ Downloading {num_urls} link{'s' if num_urls > 1 else ''}... (initializing)",
     )
 
     last_text = ""
@@ -299,59 +322,123 @@ async def _run_job(
             except Exception:
                 pass
 
-    def _post_status(line: str) -> None:
-        elapsed = int(time.time() - started)
-        body = f"{line}\n⏱️ Elapsed: {elapsed}s"
-        loop = asyncio.get_running_loop()
-        asyncio.run_coroutine_threadsafe(_edit(body), loop)
+    # Per-URL progress tracking for concurrent downloads
+    _url_progress: dict[int, tuple[int, Optional[int]]] = {}
+    _progress_lock = asyncio.Lock()
 
-    def _post_progress(read: int, total: Optional[int]) -> None:
-        body = (
-            "⏳ Downloading...\n"
-            f"{_progress_bar(read, total, started)}\n"
-            f"⏱️ Elapsed: {int(time.time() - started)}s"
-        )
-        loop = asyncio.get_running_loop()
-        asyncio.run_coroutine_threadsafe(_edit(body), loop)
+    def _make_progress_cb(idx: int):
+        def _cb(read: int, total: Optional[int]) -> None:
+            _url_progress[idx] = (read, total)
+            total_read = sum(r for r, _ in _url_progress.values())
+            total_size_known = all(t is not None for _, t in _url_progress.values())
+            total_size = sum(t for _, t in _url_progress.values() if t is not None) if total_size_known else None
+            label = f"⏳ Downloading... ({len(_url_progress)}/{num_urls} active)"
+            body = (
+                f"{label}\n"
+                f"{_progress_bar(total_read, total_size, started)}\n"
+                f"⏱️ Elapsed: {int(time.time() - started)}s"
+            )
+            loop = asyncio.get_running_loop()
+            asyncio.run_coroutine_threadsafe(_edit(body), loop)
+        return _cb
+
+    def _make_status_cb(idx: int):
+        def _cb(line: str) -> None:
+            prefix = f"[{idx + 1}/{num_urls}] " if num_urls > 1 else ""
+            elapsed = int(time.time() - started)
+            body = f"{prefix}{line}\n⏱️ Elapsed: {elapsed}s"
+            loop = asyncio.get_running_loop()
+            asyncio.run_coroutine_threadsafe(_edit(body), loop)
+        return _cb
 
     workdir = Path(tempfile.mkdtemp(prefix="logs2cookie-"))
     try:
-        try:
-            result = await async_run_pipeline(
-                url,
-                workdir,
-                password=password,
-                keywords=keywords,
-                max_bytes=MAX_DOWNLOAD_BYTES,
-                on_status=_post_status,
-                on_progress=_post_progress,
-            )
-        except Exception as exc:
-            log.exception("pipeline failed for %s", url)
-            await _edit(f"❌ Error: {exc}")
-            return
+        # Run all URLs concurrently
+        async def _run_one(idx: int, url: str) -> Optional[object]:
+            sub_workdir = workdir / f"job_{idx}"
+            try:
+                return await async_run_pipeline(
+                    url,
+                    sub_workdir,
+                    password=password,
+                    keywords=keywords,
+                    max_bytes=MAX_DOWNLOAD_BYTES,
+                    on_status=_make_status_cb(idx),
+                    on_progress=_make_progress_cb(idx),
+                    num_connections=DOWNLOAD_CONNECTIONS,
+                )
+            except Exception as exc:
+                log.exception("pipeline failed for %s", url)
+                return exc
+
+        tasks = [_run_one(i, u) for i, u in enumerate(urls)]
+        raw_results = await asyncio.gather(*tasks)
+
+        # Merge results
+        from pipeline.pipeline import PipelineResult
+        total_bytes_read = 0
+        all_cookie_files: list[Path] = []
+        total_cookie_count = 0
+        errors: list[str] = []
+        output_dir = workdir / "merged_output"
+        cookies_dir = output_dir / "cookies"
+        cookies_dir.mkdir(parents=True, exist_ok=True)
+
+        for idx, res in enumerate(raw_results):
+            if isinstance(res, Exception):
+                errors.append(f"Link {idx + 1}: {res}")
+                continue
+            if not isinstance(res, PipelineResult):
+                continue
+            total_bytes_read += res.bytes_read
+            total_cookie_count += res.cookie_count
+            for src_file in res.cookie_files:
+                dst = cookies_dir / f"link{idx + 1}_{src_file.name}"
+                shutil.copy2(src_file, dst)
+                all_cookie_files.append(dst)
 
         elapsed = int(time.time() - started)
-        speed = result.bytes_read / (time.time() - started) if (time.time() - started) > 0 else 0
+        speed = total_bytes_read / (time.time() - started) if (time.time() - started) > 0 else 0
 
-        if result.cookie_count == 0:
+        if errors and not all_cookie_files:
+            error_text = "\n".join(errors)
+            await _edit(f"❌ All downloads failed:\n{error_text}")
+            return
+
+        if errors:
+            error_text = "\n".join(errors)
+            loop = asyncio.get_running_loop()
+            asyncio.run_coroutine_threadsafe(
+                _edit(f"⚠️ Some links failed:\n{error_text}\nProcessing successful ones..."),
+                loop,
+            )
+
+        if total_cookie_count == 0:
             await _edit(
                 "ℹ️ Done — no matching cookies found.\n"
-                f"📡 Read: {_human_bytes(result.bytes_read)} "
+                f"📡 Read: {_human_bytes(total_bytes_read)} "
                 f"({_human_speed(speed)})\n"
                 f"⏱️ Elapsed: {elapsed}s"
             )
             return
 
-        zip_size = result.zip_path.stat().st_size
+        # Zip merged results
+        zip_path = output_dir / "cookies_result.zip"
+        with zipfile.ZipFile(
+            zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1,
+        ) as z:
+            for p in all_cookie_files:
+                z.write(p, arcname=p.relative_to(output_dir).as_posix())
+
+        zip_size = zip_path.stat().st_size
 
         if zip_size > DOC_UPLOAD_LIMIT:
             await _edit(
                 f"❌ Result zip is too large for Telegram "
                 f"({_human_bytes(zip_size)} > "
                 f"{_human_bytes(DOC_UPLOAD_LIMIT)}).\n"
-                f"📦 {len(result.cookie_files)} cookie set(s) — "
-                f"{result.cookie_count} cookies\n"
+                f"📦 {len(all_cookie_files)} cookie set(s) — "
+                f"{total_cookie_count} cookies\n"
                 "Tip: re-run with a stricter keyword filter to shrink "
                 "the result."
             )
@@ -359,28 +446,28 @@ async def _run_job(
 
         await _edit(
             "📤 Uploading result...\n"
-            f"📦 {len(result.cookie_files)} cookie set(s) — "
-            f"{result.cookie_count} cookies\n"
+            f"📦 {len(all_cookie_files)} cookie set(s) — "
+            f"{total_cookie_count} cookies\n"
             f"📡 zip: {_human_bytes(zip_size)}\n"
             f"⏱️ Elapsed: {elapsed}s"
         )
-        with open(result.zip_path, "rb") as f:
+        with open(zip_path, "rb") as f:
             await context.bot.send_document(
                 chat_id=chat_id,
                 document=f,
-                filename=result.zip_path.name,
+                filename=zip_path.name,
                 caption=(
-                    f"✅ {len(result.cookie_files)} cookie set(s) — "
-                    f"{result.cookie_count} cookies\n"
-                    f"📡 read: {_human_bytes(result.bytes_read)} "
+                    f"✅ {len(all_cookie_files)} cookie set(s) — "
+                    f"{total_cookie_count} cookies\n"
+                    f"📡 read: {_human_bytes(total_bytes_read)} "
                     f"({_human_speed(speed)})\n"
                     f"⏱️ {elapsed}s"
                 ),
             )
         await _edit(
             f"✅ Done! Sent {_human_bytes(zip_size)} "
-            f"({len(result.cookie_files)} sets, "
-            f"{result.cookie_count} cookies).\n"
+            f"({len(all_cookie_files)} sets, "
+            f"{total_cookie_count} cookies).\n"
             f"⚡ Avg speed: {_human_speed(speed)}"
         )
     finally:
@@ -456,10 +543,12 @@ def _check_extractor_binaries() -> None:
 def main() -> None:
     app = build_app()
     log.info(
-        "logs-to-cookie bot starting (admins=%s, doc_limit=%s, max_dl=%s)",
+        "logs-to-cookie bot starting (admins=%s, doc_limit=%s, max_dl=%s, "
+        "connections=%d)",
         ADMIN_IDS or "<everyone>",
         _human_bytes(DOC_UPLOAD_LIMIT),
         _human_bytes(MAX_DOWNLOAD_BYTES),
+        DOWNLOAD_CONNECTIONS,
     )
     _check_extractor_binaries()
     app.run_polling(allowed_updates=Update.ALL_TYPES)

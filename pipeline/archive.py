@@ -166,10 +166,17 @@ def extract_archive(
         raise ArchiveError(f"extractor binary not found: {exc}") from exc
 
     if proc.returncode != 0:
-        # 7z returns 2 for "fatal error" which is what we get on a bad
-        # password; surface a friendly message either way.
-        stderr = (proc.stderr or proc.stdout or "").strip().splitlines()
-        tail = stderr[-1] if stderr else f"rc={proc.returncode}"
+        output = (proc.stderr or proc.stdout or "").strip()
+        lines = output.splitlines()
+        tail = lines[-1] if lines else f"rc={proc.returncode}"
+        # Detect wrong-password errors across 7z/unrar output
+        low = output.lower()
+        if "wrong password" in low or "crc failed" in low or "encrypted" in low:
+            raise ArchiveError(
+                "wrong password — the archive is encrypted and the "
+                "password you provided didn't work. Please check "
+                "and try again with /start."
+            )
         raise ArchiveError(f"extraction failed: {tail}")
 
     return dest_dir

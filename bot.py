@@ -7,7 +7,7 @@ Implements the interactive flow shown in
        └─► Bot asks for the direct download URL of the logs
             └─► Bot asks for the archive password (or /skip)
                  └─► Bot asks for keywords to filter on (or /skip)
-                      └─► Pipeline runs (chunked download → parse →
+                      └─► Pipeline runs (async download → parse →
                           convert → 1 file per cookie set → zip)
                            └─► Bot returns the zip directly. If the
                                zip is bigger than Telegram's bot upload
@@ -16,6 +16,13 @@ Implements the interactive flow shown in
 
 Run as ``worker: python bot.py``. ``BOT_TOKEN`` and ``ADMIN_IDS`` are
 read from the environment (or a local ``.env`` file).
+
+Performance improvements in v2.1:
+- Async aiohttp downloads (8x chunk size, non-blocking I/O)
+- Retry with exponential backoff for transient failures
+- Faster progress updates (every 0.5s instead of 1.0s)
+- Download speed indicator in progress bar
+- Concurrent cookie file processing for large archives
 """
 
 from __future__ import annotations
@@ -42,7 +49,7 @@ from telegram.ext import (
     filters,
 )
 
-from pipeline import run_pipeline
+from pipeline import async_run_pipeline
 from pipeline.archive import SEVENZIP_BINARIES
 
 load_dotenv()
@@ -112,14 +119,42 @@ def _human_bytes(n: int) -> str:
     return f"{n} B"
 
 
-def _progress_bar(read: int, total: Optional[int], width: int = 12) -> str:
+def _human_speed(bytes_per_sec: float) -> str:
+    """Format download speed in human-readable form."""
+    if bytes_per_sec >= 1024 * 1024:
+        return f"{bytes_per_sec / (1024 * 1024):.1f} MB/s"
+    if bytes_per_sec >= 1024:
+        return f"{bytes_per_sec / 1024:.1f} KB/s"
+    return f"{bytes_per_sec:.0f} B/s"
+
+
+def _progress_bar(
+    read: int,
+    total: Optional[int],
+    started: float,
+    width: int = 12,
+) -> str:
+    elapsed = time.time() - started
+    speed = read / elapsed if elapsed > 0.1 else 0
+    speed_str = f"⚡ {_human_speed(speed)}" if speed > 0 else ""
+
     if total and total > 0:
         ratio = min(1.0, read / total)
         filled = int(ratio * width)
         bar = "▓" * filled + "░" * (width - filled)
         pct = f"{ratio * 100:.1f}%"
-        return f"{bar} {pct}  ({_human_bytes(read)} / {_human_bytes(total)})"
-    return f"░░░░░░░░░░░░ — ({_human_bytes(read)} so far)"
+        eta = ""
+        if speed > 0 and ratio < 1.0:
+            remaining = (total - read) / speed
+            if remaining < 60:
+                eta = f"  ~{remaining:.0f}s left"
+            else:
+                eta = f"  ~{remaining / 60:.1f}min left"
+        return (
+            f"{bar} {pct}  ({_human_bytes(read)} / {_human_bytes(total)})\n"
+            f"{speed_str}{eta}"
+        )
+    return f"░░░░░░░░░░░░ — ({_human_bytes(read)} so far)\n{speed_str}"
 
 
 def _split_keywords(text: str) -> list[str]:
@@ -166,13 +201,7 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def on_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Phase 2a — INPUT. User just sent the download URL.
-
-    Tokenised CDN URLs (LinkForge, Telegram-CDN, file-host paths…)
-    rarely carry a ``.zip``/``.7z``/``.rar`` suffix, so we can't tell
-    from the URL alone whether the body is encrypted. Always ask for
-    the password — the user can /skip if the archive isn't protected.
-    """
+    """Phase 2a — INPUT. User just sent the download URL."""
     text = (update.message.text or "").strip()
     if text.startswith("/"):
         return await cmd_cancel(update, context)
@@ -253,61 +282,63 @@ async def _run_job(
 
     status_msg = await context.bot.send_message(
         chat_id=chat_id,
-        text="⏳ Downloading...",
+        text="⏳ Downloading... (initializing)",
     )
 
-    loop = asyncio.get_event_loop()
     last_text = ""
+    _edit_lock = asyncio.Lock()
 
     async def _edit(text: str) -> None:
         nonlocal last_text
-        if text == last_text:
-            return
-        last_text = text
-        try:
-            await status_msg.edit_text(text)
-        except Exception:  # noqa: BLE001
-            pass
+        async with _edit_lock:
+            if text == last_text:
+                return
+            last_text = text
+            try:
+                await status_msg.edit_text(text)
+            except Exception:
+                pass
 
     def _post_status(line: str) -> None:
         elapsed = int(time.time() - started)
         body = f"{line}\n⏱️ Elapsed: {elapsed}s"
+        loop = asyncio.get_running_loop()
         asyncio.run_coroutine_threadsafe(_edit(body), loop)
 
     def _post_progress(read: int, total: Optional[int]) -> None:
-        elapsed = int(time.time() - started)
         body = (
             "⏳ Downloading...\n"
-            f"{_progress_bar(read, total)}\n"
-            f"⏱️ Elapsed: {elapsed}s"
+            f"{_progress_bar(read, total, started)}\n"
+            f"⏱️ Elapsed: {int(time.time() - started)}s"
         )
+        loop = asyncio.get_running_loop()
         asyncio.run_coroutine_threadsafe(_edit(body), loop)
 
     workdir = Path(tempfile.mkdtemp(prefix="logs2cookie-"))
     try:
         try:
-            result = await loop.run_in_executor(
-                None,
-                lambda: run_pipeline(
-                    url,
-                    workdir,
-                    password=password,
-                    keywords=keywords,
-                    max_bytes=MAX_DOWNLOAD_BYTES,
-                    on_status=_post_status,
-                    on_progress=_post_progress,
-                ),
+            result = await async_run_pipeline(
+                url,
+                workdir,
+                password=password,
+                keywords=keywords,
+                max_bytes=MAX_DOWNLOAD_BYTES,
+                on_status=_post_status,
+                on_progress=_post_progress,
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             log.exception("pipeline failed for %s", url)
             await _edit(f"❌ Error: {exc}")
             return
 
         elapsed = int(time.time() - started)
+        speed = result.bytes_read / (time.time() - started) if (time.time() - started) > 0 else 0
+
         if result.cookie_count == 0:
             await _edit(
                 "ℹ️ Done — no matching cookies found.\n"
-                f"📡 Read: {_human_bytes(result.bytes_read)}\n"
+                f"📡 Read: {_human_bytes(result.bytes_read)} "
+                f"({_human_speed(speed)})\n"
                 f"⏱️ Elapsed: {elapsed}s"
             )
             return
@@ -341,14 +372,16 @@ async def _run_job(
                 caption=(
                     f"✅ {len(result.cookie_files)} cookie set(s) — "
                     f"{result.cookie_count} cookies\n"
-                    f"📡 read: {_human_bytes(result.bytes_read)}\n"
+                    f"📡 read: {_human_bytes(result.bytes_read)} "
+                    f"({_human_speed(speed)})\n"
                     f"⏱️ {elapsed}s"
                 ),
             )
         await _edit(
             f"✅ Done! Sent {_human_bytes(zip_size)} "
             f"({len(result.cookie_files)} sets, "
-            f"{result.cookie_count} cookies)."
+            f"{result.cookie_count} cookies).\n"
+            f"⚡ Avg speed: {_human_speed(speed)}"
         )
     finally:
         context.user_data.clear()
@@ -399,13 +432,7 @@ def build_app() -> Application:
 
 
 def _check_extractor_binaries() -> None:
-    """Warn loudly at startup if the archive extractor isn't on PATH.
-
-    The previous failure mode was: bot deploys cleanly, accepts the
-    URL, downloads multi-GB of data, and only then fails with
-    ``❌ Error: 7z binary not found``. That's a terrible UX. Surface
-    it in the deploy log instead.
-    """
+    """Warn loudly at startup if the archive extractor isn't on PATH."""
     def _first_on_path(candidates: Sequence[str]) -> Optional[str]:
         for c in candidates:
             p = shutil.which(c)

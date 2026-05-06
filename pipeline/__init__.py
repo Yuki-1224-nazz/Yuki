@@ -14,8 +14,13 @@ from .cookies import (
     parse_cookie_line,
     write_netscape_file,
 )
-from .download import DownloadError, download_to_file, stream_lines
-from .pipeline import PipelineResult, run_pipeline
+from .download import (
+    DownloadError,
+    async_download_to_file,
+    download_to_file,
+    stream_lines,
+)
+from .pipeline import PipelineResult, async_run_pipeline, run_pipeline
 
 __all__ = [
     "ARCHIVE_SUFFIXES",
@@ -24,6 +29,8 @@ __all__ = [
     "DownloadError",
     "NETSCAPE_HEADER",
     "PipelineResult",
+    "async_download_to_file",
+    "async_run_pipeline",
     "detect_archive_kind",
     "download_to_file",
     "extract_archive",

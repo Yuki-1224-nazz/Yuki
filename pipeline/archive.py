@@ -169,9 +169,18 @@ def extract_archive(
         # 7z exit codes: 0=ok, 1=warnings (some files skipped),
         # 2=fatal error. For code 1 or 2, check if any files were
         # actually extracted before raising.
-        extracted_any = dest_dir.exists() and any(dest_dir.iterdir())
-        stderr = (proc.stderr or proc.stdout or "").strip().splitlines()
-        tail = stderr[-1] if stderr else f"rc={proc.returncode}"
+        extracted_any = dest_dir.exists() and any(
+            p for p in dest_dir.rglob("*") if p.is_file()
+        )
+        output = (proc.stderr or proc.stdout or "").strip()
+        stderr_lines = output.splitlines()
+        tail = stderr_lines[-1] if stderr_lines else f"rc={proc.returncode}"
+
+        is_password_error = (
+            "Wrong password" in output
+            or "CRC Failed" in output
+            or "Data Error" in output
+        )
 
         if proc.returncode == 1 and extracted_any:
             log.warning("extraction completed with warnings: %s", tail)
@@ -180,6 +189,17 @@ def extract_archive(
                 "extraction had errors (rc=%d) but some files extracted: %s",
                 proc.returncode,
                 tail,
+            )
+        elif is_password_error:
+            if password is None or password == "":
+                raise ArchiveError(
+                    "This archive is password-protected. "
+                    "Please provide the password and try again."
+                )
+            raise ArchiveError(
+                "Wrong password — the archive is encrypted and the "
+                "password you provided doesn't match. "
+                "Please check the password and try again."
             )
         else:
             raise ArchiveError(f"extraction failed: {tail}")

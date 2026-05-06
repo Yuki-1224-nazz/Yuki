@@ -33,8 +33,9 @@ DEFAULT_USER_AGENT = (
 )
 MAX_RETRIES = 5
 RETRY_BACKOFF_BASE = 2.0  # seconds
-PARALLEL_CONNECTIONS = 8
+PARALLEL_CONNECTIONS = 16
 PARALLEL_MIN_FILE_SIZE = 10 * 1024 * 1024  # 10 MB — below this, single connection is fine
+PARALLEL_MIN_SEGMENT = 2 * 1024 * 1024  # 2 MB minimum per segment
 
 
 class DownloadError(RuntimeError):
@@ -43,6 +44,10 @@ class DownloadError(RuntimeError):
     def __init__(self, message: str, *, retryable: bool = False) -> None:
         super().__init__(message)
         self.retryable = retryable
+
+
+class _RangeNotSupported(Exception):
+    """Server returned 200 instead of 206 — Range header ignored."""
 
 
 ProgressCallback = Callable[[int, Optional[int]], None]
@@ -131,7 +136,16 @@ async def _download_segment(
                 async with session.get(url, allow_redirects=True) as resp:
                     if resp.status == 416:
                         break
-                    if resp.status not in (200, 206):
+                    if resp.status in (429, 503):
+                        raise aiohttp.ClientResponseError(
+                            resp.request_info,
+                            resp.history,
+                            status=resp.status,
+                            message=f"HTTP {resp.status}",
+                        )
+                    if resp.status == 200:
+                        raise _RangeNotSupported()
+                    if resp.status != 206:
                         raise DownloadError(
                             f"segment {segment_idx}: HTTP {resp.status}"
                         )
@@ -182,7 +196,7 @@ async def _parallel_download(
             f"file is {file_size} bytes, larger than max ({max_bytes})"
         )
 
-    n_conn = min(PARALLEL_CONNECTIONS, max(1, file_size // (5 * 1024 * 1024)))
+    n_conn = min(PARALLEL_CONNECTIONS, max(1, file_size // PARALLEL_MIN_SEGMENT))
     seg_size = file_size // n_conn
 
     segments: list[tuple[int, int]] = []
@@ -415,17 +429,23 @@ async def async_download_to_file(
     ):
         log.info(
             "using parallel download (%d connections) for %d byte file",
-            min(PARALLEL_CONNECTIONS, max(1, file_size // (5 * 1024 * 1024))),
+            min(PARALLEL_CONNECTIONS, max(1, file_size // PARALLEL_MIN_SEGMENT)),
             file_size,
         )
-        return await _parallel_download(
-            url, dest,
-            file_size,
-            max_bytes=max_bytes,
-            on_progress=on_progress,
-            progress_interval=progress_interval,
-            extra_headers=extra_headers,
-        )
+        try:
+            return await _parallel_download(
+                url, dest,
+                file_size,
+                max_bytes=max_bytes,
+                on_progress=on_progress,
+                progress_interval=progress_interval,
+                extra_headers=extra_headers,
+            )
+        except _RangeNotSupported:
+            log.warning(
+                "server advertised Range support but returned 200, "
+                "falling back to single-connection download"
+            )
 
     log.info("using single-connection download")
     return await _single_download(

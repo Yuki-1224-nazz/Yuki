@@ -231,14 +231,22 @@ async def _parallel_download(
         if on_progress is not None:
             reporter_task = asyncio.create_task(_progress_reporter())
 
-        tasks = [
-            _download_segment(
-                url, dest, seg_start, seg_end, idx,
-                headers, timeout, connector, progress_map, progress_lock,
+        task_objects = [
+            asyncio.create_task(
+                _download_segment(
+                    url, dest, seg_start, seg_end, idx,
+                    headers, timeout, connector, progress_map, progress_lock,
+                )
             )
             for idx, (seg_start, seg_end) in enumerate(segments)
         ]
-        results = await asyncio.gather(*tasks)
+        try:
+            results = await asyncio.gather(*task_objects)
+        except BaseException:
+            for t in task_objects:
+                t.cancel()
+            await asyncio.gather(*task_objects, return_exceptions=True)
+            raise
 
         total_written = sum(results)
 
@@ -417,7 +425,7 @@ async def async_download_to_file(
             file_size, supports_range = await _probe_file(
                 url, _base_headers(extra_headers), timeout, connector,
             )
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError, DownloadError):
             file_size, supports_range = None, False
     finally:
         await connector.close()

@@ -86,6 +86,7 @@ async def async_download_to_file(
 
     try:
         for attempt in range(1, MAX_RETRIES + 1):
+            written = 0
             try:
                 async with aiohttp.ClientSession(
                     connector=connector,

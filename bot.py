@@ -433,7 +433,7 @@ async def _do_download(
         speed = total_bytes_all / (time.time() - started) if (time.time() - started) > 0 else 0
 
         if not results_to_send:
-            if total_cookies_all == 0 and total_files > 1:
+            if total_cookies_all == 0 and total_files > 1 and total_bytes_all > 0:
                 await _edit(
                     f"ℹ️ Done — processed {total_files} files, "
                     "no matching cookies found.\n"

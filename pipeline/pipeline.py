@@ -166,6 +166,7 @@ async def async_run_pipeline(
     max_bytes: Optional[int] = None,
     on_status: Optional[StatusCallback] = None,
     on_progress: Optional[ProgressCallback] = None,
+    extra_headers: Optional[dict[str, str]] = None,
 ) -> PipelineResult:
     """Async version of run_pipeline — uses aiohttp for faster downloads.
 
@@ -203,6 +204,7 @@ async def async_run_pipeline(
         download_path,
         max_bytes=max_bytes,
         on_progress=on_progress,
+        extra_headers=extra_headers,
     )
     result.bytes_read = bytes_read
 
@@ -217,6 +219,12 @@ async def async_run_pipeline(
         await loop.run_in_executor(
             None, lambda: extract_archive(download_path, extracted, password=password)
         )
+
+        # Free disk space — the archive is no longer needed after extraction
+        try:
+            download_path.unlink()
+        except OSError:
+            pass
 
         status("⚙ Processing... (scanning extracted files)")
         sources = await loop.run_in_executor(None, lambda: _find_cookie_files(extracted))

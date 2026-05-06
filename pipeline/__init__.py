@@ -21,6 +21,13 @@ from .download import (
     stream_lines,
 )
 from .pipeline import PipelineResult, async_run_pipeline, run_pipeline
+from .resolvers import (
+    SUPPORTED_HOSTS,
+    ResolveError,
+    ResolvedFile,
+    is_hosted_link,
+    resolve_url,
+)
 
 __all__ = [
     "ARCHIVE_SUFFIXES",
@@ -37,6 +44,11 @@ __all__ = [
     "extract_cookies_from_text",
     "is_archive_url",
     "parse_cookie_line",
+    "resolve_url",
+    "ResolvedFile",
+    "ResolveError",
+    "SUPPORTED_HOSTS",
+    "is_hosted_link",
     "run_pipeline",
     "stream_lines",
     "write_netscape_file",

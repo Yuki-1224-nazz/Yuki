@@ -163,11 +163,12 @@ def _extract_with_unzip(
     dest_dir: Path,
     password: Optional[str],
     timeout: int,
-) -> subprocess.CompletedProcess[str]:
+) -> Optional[subprocess.CompletedProcess[str]]:
     """Fallback: extract ZIP archives using the ``unzip`` command."""
     bin_path = _which_first(UNZIP_BINARIES)
     if bin_path is None:
-        raise ArchiveError("unzip binary not found")
+        log.warning("unzip binary not found, skipping fallback")
+        return None
     cmd = [bin_path, "-o", str(archive_path), "-d", str(dest_dir)]
     if password is not None and password != "":
         cmd.extend(["-P", password])
@@ -183,11 +184,12 @@ def _extract_with_unrar(
     dest_dir: Path,
     password: Optional[str],
     timeout: int,
-) -> subprocess.CompletedProcess[str]:
+) -> Optional[subprocess.CompletedProcess[str]]:
     """Fallback: extract RAR archives using the ``unrar`` command."""
     bin_path = _which_first(UNRAR_BINARIES)
     if bin_path is None:
-        raise ArchiveError("unrar binary not found")
+        log.warning("unrar binary not found, skipping fallback")
+        return None
     cmd = [bin_path, "x", "-y"]
     if password is not None and password != "":
         cmd.append(f"-p{password}")
@@ -256,8 +258,10 @@ def extract_archive(
             log.info("falling back to Python zipfile for %s", archive_path.name)
             _extract_with_python_zipfile(archive_path, dest_dir, password)
             return dest_dir
-        except ArchiveError:
-            raise
+        except ArchiveError as exc:
+            if _is_wrong_password(str(exc)):
+                raise
+            log.warning("Python zipfile failed: %s", exc)
         except Exception as exc:
             log.warning("Python zipfile failed: %s", exc)
 
@@ -266,16 +270,17 @@ def extract_archive(
         try:
             log.info("falling back to unzip command for %s", archive_path.name)
             proc = _extract_with_unzip(archive_path, dest_dir, password, timeout)
-            if proc.returncode == 0:
-                return dest_dir
-            unzip_error = (proc.stderr or proc.stdout or "").strip()
-            log.warning("unzip failed (rc=%d): %s", proc.returncode, unzip_error)
-            if _is_wrong_password(unzip_error):
-                raise ArchiveError(
-                    "wrong password — the archive is encrypted and the "
-                    "password you provided didn't work. Please check "
-                    "and try again with /start."
-                )
+            if proc is not None:
+                if proc.returncode == 0:
+                    return dest_dir
+                unzip_error = (proc.stderr or proc.stdout or "").strip()
+                log.warning("unzip failed (rc=%d): %s", proc.returncode, unzip_error)
+                if _is_wrong_password(unzip_error):
+                    raise ArchiveError(
+                        "wrong password — the archive is encrypted and the "
+                        "password you provided didn't work. Please check "
+                        "and try again with /start."
+                    )
         except ArchiveError:
             raise
         except subprocess.TimeoutExpired as exc:
@@ -288,16 +293,17 @@ def extract_archive(
         try:
             log.info("falling back to unrar for %s", archive_path.name)
             proc = _extract_with_unrar(archive_path, dest_dir, password, timeout)
-            if proc.returncode == 0:
-                return dest_dir
-            unrar_error = (proc.stderr or proc.stdout or "").strip()
-            log.warning("unrar failed (rc=%d): %s", proc.returncode, unrar_error)
-            if _is_wrong_password(unrar_error):
-                raise ArchiveError(
-                    "wrong password — the archive is encrypted and the "
-                    "password you provided didn't work. Please check "
-                    "and try again with /start."
-                )
+            if proc is not None:
+                if proc.returncode == 0:
+                    return dest_dir
+                unrar_error = (proc.stderr or proc.stdout or "").strip()
+                log.warning("unrar failed (rc=%d): %s", proc.returncode, unrar_error)
+                if _is_wrong_password(unrar_error):
+                    raise ArchiveError(
+                        "wrong password — the archive is encrypted and the "
+                        "password you provided didn't work. Please check "
+                        "and try again with /start."
+                    )
         except ArchiveError:
             raise
         except subprocess.TimeoutExpired as exc:

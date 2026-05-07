@@ -42,7 +42,7 @@ from typing import Optional, Sequence
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import BotCommand, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -717,7 +717,7 @@ def build_app() -> Application:
             "provider's environment variables."
         )
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
 
     conv = ConversationHandler(
         entry_points=[
@@ -775,6 +775,21 @@ def _check_extractor_binaries() -> None:
         )
     else:
         log.info("7z binary OK: %s (handles zip, 7z, rar)", sevenzip)
+
+
+async def _post_init(application: Application) -> None:
+    """Register the bot menu commands after the application starts."""
+    await application.bot.set_my_commands([
+        BotCommand("start", "Start the bot"),
+        BotCommand("help", "Show help"),
+        BotCommand("status", "Check current job status"),
+        BotCommand("settings", "View bot configuration"),
+        BotCommand("history", "Recent job history"),
+        BotCommand("connections", "View/set download connections"),
+        BotCommand("info", "Bot version & uptime"),
+        BotCommand("cancel", "Cancel current job"),
+    ])
+    log.info("Bot menu commands registered.")
 
 
 def main() -> None:

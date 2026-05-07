@@ -110,6 +110,28 @@ def _is_wrong_password(output: str) -> bool:
     )
 
 
+def _run_extractor(
+    cmd: list[str],
+    timeout: int,
+) -> subprocess.CompletedProcess[str]:
+    """Run an extractor command, decoding output as UTF-8 with replacement.
+
+    Archives frequently contain filenames with non-UTF-8 bytes (e.g.
+    Windows-1251 Cyrillic, Shift-JIS, etc.).  Using ``text=True`` would
+    crash with ``UnicodeDecodeError``, so we capture raw bytes and
+    decode manually with ``errors="replace"``.
+    """
+    proc = subprocess.run(
+        cmd, capture_output=True, timeout=timeout, check=False,
+    )
+    return subprocess.CompletedProcess(
+        args=proc.args,
+        returncode=proc.returncode,
+        stdout=proc.stdout.decode("utf-8", errors="replace") if proc.stdout else "",
+        stderr=proc.stderr.decode("utf-8", errors="replace") if proc.stderr else "",
+    )
+
+
 def _extract_with_7z(
     archive_path: Path,
     dest_dir: Path,
@@ -130,9 +152,7 @@ def _extract_with_7z(
         cmd.insert(2, "-p-")
 
     log.info("7z extract: %s", " ".join(cmd))
-    return subprocess.run(
-        cmd, capture_output=True, text=True, timeout=timeout, check=False,
-    )
+    return _run_extractor(cmd, timeout)
 
 
 def _extract_with_python_zipfile(
@@ -174,9 +194,7 @@ def _extract_with_unzip(
         cmd.extend(["-P", password])
 
     log.info("unzip extract: %s", " ".join(cmd))
-    return subprocess.run(
-        cmd, capture_output=True, text=True, timeout=timeout, check=False,
-    )
+    return _run_extractor(cmd, timeout)
 
 
 def _extract_with_unrar(
@@ -198,9 +216,7 @@ def _extract_with_unrar(
     cmd += [str(archive_path), str(dest_dir) + "/"]
 
     log.info("unrar extract: %s", " ".join(cmd))
-    return subprocess.run(
-        cmd, capture_output=True, text=True, timeout=timeout, check=False,
-    )
+    return _run_extractor(cmd, timeout)
 
 
 def extract_archive(

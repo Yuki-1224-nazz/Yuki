@@ -2,4 +2,4 @@
 # p7zip handles encrypted .zip, .7z, and (via its own RAR codec) .rar
 # archives — ``unrar`` is no longer required.
 [phases.setup]
-nixPkgs = ["p7zip", "unrar", "unzip"]
+nixPkgs = ["p7zip", "unzip"]

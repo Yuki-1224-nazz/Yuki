@@ -2,4 +2,4 @@
 # 7zip (7zz) is the modern 7-Zip for Linux — supports ZSTD and all
 # modern compression methods.  p7zip is kept as a fallback.
 [phases.setup]
-nixPkgs = ["_7zz", "p7zip", "unzip"]
+nixPkgs = ["_7zz", "p7zip", "unrar", "unzip"]

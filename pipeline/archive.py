@@ -1,14 +1,16 @@
 """Archive extraction helpers (zip / 7z / rar).
 
-All three archive types route through ``7z`` (from ``p7zip-full``) —
-recent versions of p7zip support both RAR4 and RAR5 archives in
-addition to zip and 7z, including encryption. The proprietary ``unrar``
-binary is checked as a fallback for RAR archives, but is no longer
-required — it's not available on Railway's Railpack runtime image.
+Extraction strategy is tailored per archive type:
 
-When ``7z`` fails with "Unsupported Method" (common with ZIP archives
-that use ZSTD or other modern compression), the bot falls back to
-Python's built-in :mod:`zipfile` and then to the ``unzip`` command.
+**RAR** — ``unrar`` is the primary extractor (only tool that fully
+supports RAR5 encryption + compression).  ``7z``/``7zz`` are tried
+as fallbacks but often produce 0-byte files on RAR5 archives.
+
+**ZIP** — ``7zz`` (modern 7-Zip, supports ZSTD etc.) is preferred,
+with ``7z`` (legacy p7zip), Python's :mod:`zipfile`, and ``unzip``
+as fallbacks.
+
+**7z** — ``7zz`` is preferred over legacy ``7z``.
 
 The bot accepts CDN URLs that don't carry an ``.zip``/``.7z``/``.rar``
 suffix in their path (e.g. tokenised LinkForge / file-host URLs), so
@@ -30,10 +32,6 @@ log = logging.getLogger(__name__)
 
 ARCHIVE_SUFFIXES: tuple[str, ...] = (".zip", ".7z", ".rar")
 
-# Magic byte signatures, in (kind, prefix) tuples. ZIP has three valid
-# leading records (local file header, end-of-central-directory record,
-# data descriptor) so we list all three. RAR4 and RAR5 share the
-# leading ``Rar!\x1a\x07`` so a single 7-byte prefix covers both.
 MAGIC_SIGNATURES: tuple[tuple[str, bytes], ...] = (
     ("zip", b"PK\x03\x04"),
     ("zip", b"PK\x05\x06"),
@@ -43,14 +41,12 @@ MAGIC_SIGNATURES: tuple[tuple[str, bytes], ...] = (
 )
 
 # Prefer ``7zz`` (modern 7-Zip for Linux, supports ZSTD and all
-# modern compression methods) over ``7z`` (legacy p7zip, which chokes
-# on newer ZIP methods).  macOS Homebrew also installs ``7zz``.
+# modern compression methods) over ``7z`` (legacy p7zip).
 SEVENZIP_BINARIES: tuple[str, ...] = ("7zz", "7z", "7za")
 UNRAR_BINARIES: tuple[str, ...] = ("unrar",)
 UNZIP_BINARIES: tuple[str, ...] = ("unzip",)
 
-# Archives larger than this skip the Python zipfile fallback (it can
-# hang or OOM on multi-GB encrypted ZIPs).
+# Archives larger than this skip the Python zipfile fallback.
 _PYTHON_ZIP_MAX_BYTES = 500 * 1024 * 1024  # 500 MB
 
 
@@ -104,6 +100,16 @@ def _which_first(candidates: Sequence[str]) -> Optional[str]:
     return None
 
 
+def _which_all(candidates: Sequence[str]) -> list[str]:
+    """Return paths for all found binaries (preserving order)."""
+    out: list[str] = []
+    for c in candidates:
+        path = shutil.which(c)
+        if path:
+            out.append(path)
+    return out
+
+
 def _is_wrong_password(output: str) -> bool:
     """Detect wrong-password errors across 7z/unrar/unzip output."""
     low = output.lower()
@@ -115,12 +121,15 @@ def _is_wrong_password(output: str) -> bool:
     )
 
 
-def _dest_has_files(dest_dir: Path) -> bool:
-    """Return True if dest_dir contains at least one extracted file."""
+def _dest_has_real_files(dest_dir: Path) -> bool:
+    """Return True if dest_dir has at least one non-empty file."""
     try:
-        return any(dest_dir.rglob("*"))
+        for p in dest_dir.rglob("*"):
+            if p.is_file() and p.stat().st_size > 0:
+                return True
     except OSError:
-        return False
+        pass
+    return False
 
 
 def _run_extractor(
@@ -145,27 +154,78 @@ def _run_extractor(
     )
 
 
-def _extract_with_7z(
+# ── Individual extractors ──────────────────────────────────────────
+
+
+def _try_7z_binary(
+    bin_path: str,
     archive_path: Path,
     dest_dir: Path,
     password: Optional[str],
     timeout: int,
 ) -> subprocess.CompletedProcess[str]:
-    """Try extraction with 7z/7za/7zz."""
-    bin_path = _which_first(SEVENZIP_BINARIES)
-    if bin_path is None:
-        raise ArchiveError(
-            "7z binary not found — install p7zip-full on "
-            "your host (it handles zip, 7z, and rar)."
-        )
+    """Run a single 7z-family binary."""
     cmd = [bin_path, "x", "-y", f"-o{dest_dir}", str(archive_path)]
     if password is not None and password != "":
         cmd.insert(2, f"-p{password}")
     else:
         cmd.insert(2, "-p-")
-
     log.info("7z extract: %s", " ".join(cmd))
     return _run_extractor(cmd, timeout)
+
+
+def _extract_with_7z_all(
+    archive_path: Path,
+    dest_dir: Path,
+    password: Optional[str],
+    timeout: int,
+) -> Optional[subprocess.CompletedProcess[str]]:
+    """Try all available 7z-family binaries in preference order.
+
+    Returns the CompletedProcess from the first binary that succeeds
+    (rc 0 or 1 with real files), or the last CompletedProcess on
+    total failure.  Returns ``None`` when no 7z binary is found.
+    """
+    binaries = _which_all(SEVENZIP_BINARIES)
+    if not binaries:
+        log.warning("no 7z binary found on PATH")
+        return None
+
+    last_proc: Optional[subprocess.CompletedProcess[str]] = None
+    for bin_path in binaries:
+        try:
+            proc = _try_7z_binary(
+                bin_path, archive_path, dest_dir, password, timeout,
+            )
+            last_proc = proc
+            output = (proc.stderr or proc.stdout or "").strip()
+
+            if _is_wrong_password(output):
+                return proc  # caller will raise
+
+            if proc.returncode == 0:
+                return proc
+
+            # Accept any non-zero rc when real files were produced
+            if _dest_has_real_files(dest_dir):
+                log.info(
+                    "%s exited rc=%d but produced real files — "
+                    "accepting", bin_path, proc.returncode,
+                )
+                return proc
+
+            log.warning(
+                "%s failed (rc=%d): %s", bin_path, proc.returncode, output,
+            )
+            # Wipe 0-byte files so the next binary starts clean.
+            shutil.rmtree(dest_dir, ignore_errors=True)
+            dest_dir.mkdir(parents=True, exist_ok=True)
+        except subprocess.TimeoutExpired:
+            raise
+        except FileNotFoundError:
+            continue
+
+    return last_proc
 
 
 def _extract_with_python_zipfile(
@@ -205,7 +265,6 @@ def _extract_with_unzip(
     cmd = [bin_path, "-o", str(archive_path), "-d", str(dest_dir)]
     if password is not None and password != "":
         cmd.extend(["-P", password])
-
     log.info("unzip extract: %s", " ".join(cmd))
     return _run_extractor(cmd, timeout)
 
@@ -216,20 +275,58 @@ def _extract_with_unrar(
     password: Optional[str],
     timeout: int,
 ) -> Optional[subprocess.CompletedProcess[str]]:
-    """Fallback: extract RAR archives using the ``unrar`` command."""
+    """Extract RAR archives using the ``unrar`` command."""
     bin_path = _which_first(UNRAR_BINARIES)
     if bin_path is None:
-        log.warning("unrar binary not found, skipping fallback")
+        log.warning("unrar binary not found, skipping")
         return None
-    cmd = [bin_path, "x", "-y"]
+    cmd = [bin_path, "x", "-y", "-o+"]
     if password is not None and password != "":
         cmd.append(f"-p{password}")
     else:
         cmd.append("-p-")
     cmd += [str(archive_path), str(dest_dir) + "/"]
-
     log.info("unrar extract: %s", " ".join(cmd))
     return _run_extractor(cmd, timeout)
+
+
+# ── Dispatcher helpers ─────────────────────────────────────────────
+
+
+def _check_proc_result(
+    proc: Optional[subprocess.CompletedProcess[str]],
+    dest_dir: Path,
+    label: str,
+) -> Optional[str]:
+    """Return ``None`` on success, or an error string on failure.
+
+    Success means rc 0 **or** rc 1 with real (non-zero-byte) files.
+    """
+    if proc is None:
+        return f"{label} not available"
+    output = (proc.stderr or proc.stdout or "").strip()
+    if _is_wrong_password(output):
+        raise ArchiveError(
+            "wrong password — the archive is encrypted and the "
+            "password you provided didn't work. Please check "
+            "and try again with /start."
+        )
+    # Accept ANY exit code as long as real (non-zero-byte) files were
+    # actually extracted.  Extractors often return non-zero for partial
+    # success (e.g. 7z rc=1 = warnings, unrar rc=9 = disk-full but
+    # many files already extracted, etc.).
+    if _dest_has_real_files(dest_dir):
+        if proc.returncode != 0:
+            log.info(
+                "%s exited with rc=%d but produced real files — "
+                "accepting as success",
+                label, proc.returncode,
+            )
+        return None
+    return output or f"{label} failed (rc={proc.returncode})"
+
+
+# ── Main entry point ───────────────────────────────────────────────
 
 
 def extract_archive(
@@ -243,16 +340,11 @@ def extract_archive(
 
     Returns ``dest_dir``. Raises :class:`ArchiveError` on any failure.
 
-    Extraction strategy (tried in order until one succeeds):
-    1. **7z** — handles zip, 7z, rar (including encrypted).
-       Return code 0 = full success, code 1 = partial success (some
-       files had warnings but others extracted fine — we accept this).
-    2. **Python zipfile** — fallback for ZIP with modern compression
-       methods that older p7zip builds don't support (e.g. ZSTD).
-       Skipped for large (>500 MB) or encrypted archives to avoid
-       hangs and OOM.
-    3. **unzip** — another fallback for ZIP archives.
-    4. **unrar** — last resort for RAR-only environments.
+    The extraction order depends on the archive type:
+
+    **RAR**: unrar → 7zz/7z (all binaries)
+    **ZIP**: 7zz/7z (all binaries) → Python zipfile → unzip
+    **7z** : 7zz/7z (all binaries)
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
     kind = detect_archive_kind(archive_path)
@@ -268,108 +360,103 @@ def extract_archive(
         archive_path, dest_dir, kind, archive_size,
     )
 
-    # --- Attempt 1: 7z ---
-    sevenzip_error = ""
-    try:
-        proc = _extract_with_7z(archive_path, dest_dir, password, timeout)
-        if proc.returncode == 0:
-            return dest_dir
+    errors: list[str] = []
 
-        # 7z return code 1 = "Warning" — some files couldn't be
-        # extracted (e.g. unsupported compression on one file) but
-        # others were extracted successfully.  Accept partial success
-        # when files were actually produced.
-        if proc.returncode == 1 and _dest_has_files(dest_dir):
-            log.info(
-                "7z returned warnings (rc=1) but extracted files — "
-                "accepting partial success"
-            )
-            return dest_dir
-
-        sevenzip_error = (proc.stderr or proc.stdout or "").strip()
-        log.warning("7z failed (rc=%d): %s", proc.returncode, sevenzip_error)
-
-        if _is_wrong_password(sevenzip_error):
-            raise ArchiveError(
-                "wrong password — the archive is encrypted and the "
-                "password you provided didn't work. Please check "
-                "and try again with /start."
-            )
-    except subprocess.TimeoutExpired as exc:
-        raise ArchiveError(f"extraction timed out after {timeout}s") from exc
-    except FileNotFoundError:
-        log.warning("7z binary not found, trying fallbacks")
-        sevenzip_error = "7z not found"
-
-    # --- Attempt 2 (ZIP only): Python zipfile ---
-    # Skip for large or encrypted archives — Python's zipfile can hang
-    # or OOM on multi-GB files and only supports legacy ZIP encryption.
-    if kind == "zip" and archive_size <= _PYTHON_ZIP_MAX_BYTES and not password:
-        try:
-            log.info("falling back to Python zipfile for %s", archive_path.name)
-            _extract_with_python_zipfile(archive_path, dest_dir, password)
-            return dest_dir
-        except ArchiveError as exc:
-            if _is_wrong_password(str(exc)):
-                raise
-            log.warning("Python zipfile failed: %s", exc)
-        except Exception as exc:
-            log.warning("Python zipfile failed: %s", exc)
-
-    # --- Attempt 3 (ZIP only): unzip command ---
-    if kind == "zip":
-        try:
-            log.info("falling back to unzip command for %s", archive_path.name)
-            proc = _extract_with_unzip(archive_path, dest_dir, password, timeout)
-            if proc is not None:
-                if proc.returncode == 0:
-                    return dest_dir
-                # unzip return code 1 = warnings too — accept partial
-                if proc.returncode == 1 and _dest_has_files(dest_dir):
-                    log.info("unzip partial success (rc=1)")
-                    return dest_dir
-                unzip_error = (proc.stderr or proc.stdout or "").strip()
-                log.warning("unzip failed (rc=%d): %s", proc.returncode, unzip_error)
-                if _is_wrong_password(unzip_error):
-                    raise ArchiveError(
-                        "wrong password — the archive is encrypted and the "
-                        "password you provided didn't work. Please check "
-                        "and try again with /start."
-                    )
-        except ArchiveError:
-            raise
-        except subprocess.TimeoutExpired as exc:
-            raise ArchiveError(f"extraction timed out after {timeout}s") from exc
-        except FileNotFoundError:
-            log.warning("unzip not found")
-
-    # --- Attempt 4 (RAR only): unrar ---
     if kind == "rar":
+        # ── RAR: prefer unrar (handles RAR5), then 7z as fallback ──
         try:
-            log.info("falling back to unrar for %s", archive_path.name)
-            proc = _extract_with_unrar(archive_path, dest_dir, password, timeout)
-            if proc is not None:
-                if proc.returncode == 0:
-                    return dest_dir
-                if proc.returncode == 1 and _dest_has_files(dest_dir):
-                    log.info("unrar partial success (rc=1)")
-                    return dest_dir
-                unrar_error = (proc.stderr or proc.stdout or "").strip()
-                log.warning("unrar failed (rc=%d): %s", proc.returncode, unrar_error)
-                if _is_wrong_password(unrar_error):
-                    raise ArchiveError(
-                        "wrong password — the archive is encrypted and the "
-                        "password you provided didn't work. Please check "
-                        "and try again with /start."
-                    )
-        except ArchiveError:
-            raise
+            proc = _extract_with_unrar(
+                archive_path, dest_dir, password, timeout,
+            )
+            err = _check_proc_result(proc, dest_dir, "unrar")
+            if err is None:
+                return dest_dir
+            errors.append(err)
         except subprocess.TimeoutExpired as exc:
-            raise ArchiveError(f"extraction timed out after {timeout}s") from exc
-        except FileNotFoundError:
-            log.warning("unrar not found")
+            raise ArchiveError(
+                f"extraction timed out after {timeout}s"
+            ) from exc
 
-    # All attempts failed — report the original 7z error
-    lines = sevenzip_error.splitlines()
-    tail = lines[-1] if lines else "all extraction methods failed"
+        # Clean dest before trying 7z
+        shutil.rmtree(dest_dir, ignore_errors=True)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            proc = _extract_with_7z_all(
+                archive_path, dest_dir, password, timeout,
+            )
+            err = _check_proc_result(proc, dest_dir, "7z")
+            if err is None:
+                return dest_dir
+            errors.append(err)
+        except subprocess.TimeoutExpired as exc:
+            raise ArchiveError(
+                f"extraction timed out after {timeout}s"
+            ) from exc
+
+    elif kind == "zip":
+        # ── ZIP: prefer 7zz/7z, then Python zipfile, then unzip ──
+        try:
+            proc = _extract_with_7z_all(
+                archive_path, dest_dir, password, timeout,
+            )
+            err = _check_proc_result(proc, dest_dir, "7z")
+            if err is None:
+                return dest_dir
+            errors.append(err)
+        except subprocess.TimeoutExpired as exc:
+            raise ArchiveError(
+                f"extraction timed out after {timeout}s"
+            ) from exc
+
+        # Python zipfile — skip for large or encrypted archives
+        if archive_size <= _PYTHON_ZIP_MAX_BYTES and not password:
+            try:
+                log.info("falling back to Python zipfile")
+                _extract_with_python_zipfile(
+                    archive_path, dest_dir, password,
+                )
+                if _dest_has_real_files(dest_dir):
+                    return dest_dir
+                errors.append("Python zipfile produced no files")
+            except ArchiveError:
+                raise
+            except Exception as exc:
+                errors.append(f"Python zipfile: {exc}")
+
+        # unzip command
+        try:
+            shutil.rmtree(dest_dir, ignore_errors=True)
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            proc = _extract_with_unzip(
+                archive_path, dest_dir, password, timeout,
+            )
+            err = _check_proc_result(proc, dest_dir, "unzip")
+            if err is None:
+                return dest_dir
+            errors.append(err)
+        except subprocess.TimeoutExpired as exc:
+            raise ArchiveError(
+                f"extraction timed out after {timeout}s"
+            ) from exc
+
+    else:
+        # ── 7z format: only 7z binaries ──
+        try:
+            proc = _extract_with_7z_all(
+                archive_path, dest_dir, password, timeout,
+            )
+            err = _check_proc_result(proc, dest_dir, "7z")
+            if err is None:
+                return dest_dir
+            errors.append(err)
+        except subprocess.TimeoutExpired as exc:
+            raise ArchiveError(
+                f"extraction timed out after {timeout}s"
+            ) from exc
+
+    # All attempts failed
+    last_error = errors[-1] if errors else "all extraction methods failed"
+    lines = last_error.splitlines()
+    tail = lines[-1] if lines else last_error
     raise ArchiveError(f"extraction failed: {tail}")

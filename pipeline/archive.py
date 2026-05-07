@@ -21,7 +21,10 @@ falling back to the suffix.
 from __future__ import annotations
 
 import logging
+import os
+import platform
 import shutil
+import stat
 import subprocess
 import zipfile
 from pathlib import Path
@@ -49,9 +52,63 @@ UNZIP_BINARIES: tuple[str, ...] = ("unzip",)
 # Archives larger than this skip the Python zipfile fallback.
 _PYTHON_ZIP_MAX_BYTES = 500 * 1024 * 1024  # 500 MB
 
+# Official RAR/UnRAR download URL (Linux x64 static binary).
+_UNRAR_URL = "https://www.rarlab.com/rar/rarlinux-x64-722.tar.gz"
+_UNRAR_LOCAL_DIR = Path.home() / ".local" / "bin"
+
 
 class ArchiveError(RuntimeError):
     """Raised when archive extraction fails."""
+
+
+def _ensure_unrar() -> Optional[str]:
+    """Return the path to ``unrar``, downloading it if needed.
+
+    If ``unrar`` is already on PATH, return it immediately.  Otherwise
+    download the official Linux x64 static binary from rarlab.com to
+    ``~/.local/bin/unrar`` and return that path.  Returns ``None`` if
+    download fails or the platform is not Linux x64.
+    """
+    existing = shutil.which("unrar")
+    if existing:
+        return existing
+
+    local_unrar = _UNRAR_LOCAL_DIR / "unrar"
+    if local_unrar.is_file():
+        return str(local_unrar)
+
+    if platform.system() != "Linux" or platform.machine() not in ("x86_64", "AMD64"):
+        log.warning("auto-download of unrar only supported on Linux x64")
+        return None
+
+    log.info("unrar not found — downloading from rarlab.com ...")
+    try:
+        import tarfile
+        import tempfile
+        import urllib.request
+
+        _UNRAR_LOCAL_DIR.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
+            tmp_path = tmp.name
+            urllib.request.urlretrieve(_UNRAR_URL, tmp_path)
+
+        with tarfile.open(tmp_path, "r:gz") as tf:
+            for member in tf.getmembers():
+                if member.name.endswith("/unrar") or member.name == "unrar":
+                    member.name = "unrar"
+                    tf.extract(member, path=str(_UNRAR_LOCAL_DIR))
+                    break
+
+        os.unlink(tmp_path)
+        local_unrar.chmod(local_unrar.stat().st_mode | stat.S_IEXEC)
+
+        if local_unrar.is_file():
+            log.info("unrar installed to %s", local_unrar)
+            return str(local_unrar)
+    except Exception:
+        log.exception("failed to download unrar")
+
+    return None
 
 
 def is_archive_url(url: str) -> bool:
@@ -276,9 +333,9 @@ def _extract_with_unrar(
     timeout: int,
 ) -> Optional[subprocess.CompletedProcess[str]]:
     """Extract RAR archives using the ``unrar`` command."""
-    bin_path = _which_first(UNRAR_BINARIES)
+    bin_path = _ensure_unrar()
     if bin_path is None:
-        log.warning("unrar binary not found, skipping")
+        log.warning("unrar binary not available, skipping")
         return None
     cmd = [bin_path, "x", "-y", "-o+"]
     if password is not None and password != "":

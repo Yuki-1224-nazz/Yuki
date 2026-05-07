@@ -48,6 +48,10 @@ SEVENZIP_BINARIES: tuple[str, ...] = ("7z", "7za", "7zz")
 UNRAR_BINARIES: tuple[str, ...] = ("unrar",)
 UNZIP_BINARIES: tuple[str, ...] = ("unzip",)
 
+# Archives larger than this skip the Python zipfile fallback (it can
+# hang or OOM on multi-GB encrypted ZIPs).
+_PYTHON_ZIP_MAX_BYTES = 500 * 1024 * 1024  # 500 MB
+
 
 class ArchiveError(RuntimeError):
     """Raised when archive extraction fails."""
@@ -108,6 +112,14 @@ def _is_wrong_password(output: str) -> bool:
         or "encrypted" in low
         or "incorrect password" in low
     )
+
+
+def _dest_has_files(dest_dir: Path) -> bool:
+    """Return True if dest_dir contains at least one extracted file."""
+    try:
+        return any(dest_dir.rglob("*"))
+    except OSError:
+        return False
 
 
 def _run_extractor(
@@ -232,8 +244,12 @@ def extract_archive(
 
     Extraction strategy (tried in order until one succeeds):
     1. **7z** — handles zip, 7z, rar (including encrypted).
+       Return code 0 = full success, code 1 = partial success (some
+       files had warnings but others extracted fine — we accept this).
     2. **Python zipfile** — fallback for ZIP with modern compression
        methods that older p7zip builds don't support (e.g. ZSTD).
+       Skipped for large (>500 MB) or encrypted archives to avoid
+       hangs and OOM.
     3. **unzip** — another fallback for ZIP archives.
     4. **unrar** — last resort for RAR-only environments.
     """
@@ -245,7 +261,11 @@ def extract_archive(
             "(magic bytes don't match zip/7z/rar)"
         )
 
-    log.info("extracting %s -> %s (kind=%s)", archive_path, dest_dir, kind)
+    archive_size = archive_path.stat().st_size
+    log.info(
+        "extracting %s -> %s (kind=%s, size=%d)",
+        archive_path, dest_dir, kind, archive_size,
+    )
 
     # --- Attempt 1: 7z ---
     sevenzip_error = ""
@@ -253,6 +273,18 @@ def extract_archive(
         proc = _extract_with_7z(archive_path, dest_dir, password, timeout)
         if proc.returncode == 0:
             return dest_dir
+
+        # 7z return code 1 = "Warning" — some files couldn't be
+        # extracted (e.g. unsupported compression on one file) but
+        # others were extracted successfully.  Accept partial success
+        # when files were actually produced.
+        if proc.returncode == 1 and _dest_has_files(dest_dir):
+            log.info(
+                "7z returned warnings (rc=1) but extracted files — "
+                "accepting partial success"
+            )
+            return dest_dir
+
         sevenzip_error = (proc.stderr or proc.stdout or "").strip()
         log.warning("7z failed (rc=%d): %s", proc.returncode, sevenzip_error)
 
@@ -269,7 +301,9 @@ def extract_archive(
         sevenzip_error = "7z not found"
 
     # --- Attempt 2 (ZIP only): Python zipfile ---
-    if kind == "zip":
+    # Skip for large or encrypted archives — Python's zipfile can hang
+    # or OOM on multi-GB files and only supports legacy ZIP encryption.
+    if kind == "zip" and archive_size <= _PYTHON_ZIP_MAX_BYTES and not password:
         try:
             log.info("falling back to Python zipfile for %s", archive_path.name)
             _extract_with_python_zipfile(archive_path, dest_dir, password)
@@ -288,6 +322,10 @@ def extract_archive(
             proc = _extract_with_unzip(archive_path, dest_dir, password, timeout)
             if proc is not None:
                 if proc.returncode == 0:
+                    return dest_dir
+                # unzip return code 1 = warnings too — accept partial
+                if proc.returncode == 1 and _dest_has_files(dest_dir):
+                    log.info("unzip partial success (rc=1)")
                     return dest_dir
                 unzip_error = (proc.stderr or proc.stdout or "").strip()
                 log.warning("unzip failed (rc=%d): %s", proc.returncode, unzip_error)
@@ -311,6 +349,9 @@ def extract_archive(
             proc = _extract_with_unrar(archive_path, dest_dir, password, timeout)
             if proc is not None:
                 if proc.returncode == 0:
+                    return dest_dir
+                if proc.returncode == 1 and _dest_has_files(dest_dir):
+                    log.info("unrar partial success (rc=1)")
                     return dest_dir
                 unrar_error = (proc.stderr or proc.stdout or "").strip()
                 log.warning("unrar failed (rc=%d): %s", proc.returncode, unrar_error)

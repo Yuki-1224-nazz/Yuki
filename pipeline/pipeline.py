@@ -239,7 +239,11 @@ async def async_run_pipeline(
     kind = detect_archive_kind(download_path)
 
     if kind is not None:
-        status(f"⚙ Processing... (extracting {kind} archive)")
+        dl_size_mb = download_path.stat().st_size / (1024 * 1024)
+        status(
+            f"⚙ Extracting {kind} archive ({dl_size_mb:.0f} MB)... "
+            "this may take a few minutes for large files"
+        )
         extracted = workdir / "extracted"
 
         loop = asyncio.get_running_loop()

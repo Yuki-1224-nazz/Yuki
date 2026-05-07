@@ -55,6 +55,7 @@ from telegram.ext import (
 
 from pipeline import async_run_pipeline
 from pipeline.archive import SEVENZIP_BINARIES
+from pipeline.cookies import iter_cookies_from_lines, write_netscape_file
 
 load_dotenv()
 
@@ -444,6 +445,9 @@ async def _run_job(
     workdir = Path(tempfile.mkdtemp(prefix="logs2cookie-"))
     try:
         # Run all URLs concurrently
+        # When multiple keywords: download without filtering, then split per keyword
+        pipeline_keywords = keywords if len(keywords) <= 1 else []
+
         async def _run_one(idx: int, url: str, pwd: Optional[str]) -> Optional[object]:
             sub_workdir = workdir / f"job_{idx}"
             try:
@@ -451,7 +455,7 @@ async def _run_job(
                     url,
                     sub_workdir,
                     password=pwd,
-                    keywords=keywords,
+                    keywords=pipeline_keywords,
                     max_bytes=MAX_DOWNLOAD_BYTES,
                     on_status=_make_status_cb(idx),
                     on_progress=_make_progress_cb(idx),
@@ -524,60 +528,124 @@ async def _run_job(
             ))
             return
 
-        # Zip merged results
-        zip_path = output_dir / "cookies_result.zip"
-        with zipfile.ZipFile(
-            zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1,
-        ) as z:
-            for p in all_cookie_files:
-                z.write(p, arcname=p.relative_to(output_dir).as_posix())
-
-        zip_size = zip_path.stat().st_size
-
-        if zip_size > DOC_UPLOAD_LIMIT:
+        # --- Per-keyword zip splitting (multiple keywords) ---
+        if len(keywords) > 1:
+            _active_jobs[user_id] = "Splitting results per keyword..."
+            sent_count = 0
+            grand_cookie_count = 0
+            for kw in keywords:
+                kw_dir = output_dir / f"kw_{kw}"
+                kw_cookies_dir = kw_dir / "cookies"
+                kw_cookies_dir.mkdir(parents=True, exist_ok=True)
+                kw_cookie_files: list[Path] = []
+                kw_count = 0
+                for i, src in enumerate(all_cookie_files, start=1):
+                    with open(src, "r", encoding="utf-8", errors="replace") as f:
+                        rows = list(iter_cookies_from_lines(f, keywords=[kw]))
+                    if rows:
+                        out_path = kw_cookies_dir / f"{i:04d}_{src.name}"
+                        write_netscape_file(out_path, rows)
+                        kw_cookie_files.append(out_path)
+                        kw_count += len(rows)
+                if not kw_cookie_files:
+                    continue
+                grand_cookie_count += kw_count
+                kw_zip = kw_dir / f"{kw}_Cookies.zip"
+                with zipfile.ZipFile(
+                    kw_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1,
+                ) as z:
+                    for p in kw_cookie_files:
+                        z.write(p, arcname=p.relative_to(kw_dir).as_posix())
+                kw_zip_size = kw_zip.stat().st_size
+                if kw_zip_size > DOC_UPLOAD_LIMIT:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"❌ `{kw}_Cookies.zip` is too large "
+                            f"({_human_bytes(kw_zip_size)} > "
+                            f"{_human_bytes(DOC_UPLOAD_LIMIT)})."
+                        ),
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                    continue
+                with open(kw_zip, "rb") as f:
+                    await context.bot.send_document(
+                        chat_id=chat_id,
+                        document=f,
+                        filename=kw_zip.name,
+                        caption=(
+                            f"🔑 {kw} — {len(kw_cookie_files)} set(s), "
+                            f"{kw_count} cookies"
+                        ),
+                    )
+                sent_count += 1
+            elapsed = int(time.time() - started)
             await _edit(
-                f"❌ Result zip is too large for Telegram "
-                f"({_human_bytes(zip_size)} > "
-                f"{_human_bytes(DOC_UPLOAD_LIMIT)}).\n"
+                f"✅ Done! Sent {sent_count} keyword zip(s) "
+                f"({grand_cookie_count} cookies total).\n"
+                f"⚡ Avg speed: {_human_speed(speed)}"
+            )
+            job_status = "success" if not errors else "partial"
+            _job_history.append(JobRecord(
+                user_id=user_id, username=username, urls=urls,
+                cookie_count=grand_cookie_count, bytes_read=total_bytes_read,
+                elapsed=elapsed, status=job_status,
+            ))
+        else:
+            # --- Single zip (0 or 1 keyword) ---
+            zip_path = output_dir / "cookies_result.zip"
+            with zipfile.ZipFile(
+                zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1,
+            ) as z:
+                for p in all_cookie_files:
+                    z.write(p, arcname=p.relative_to(output_dir).as_posix())
+
+            zip_size = zip_path.stat().st_size
+
+            if zip_size > DOC_UPLOAD_LIMIT:
+                await _edit(
+                    f"❌ Result zip is too large for Telegram "
+                    f"({_human_bytes(zip_size)} > "
+                    f"{_human_bytes(DOC_UPLOAD_LIMIT)}).\n"
+                    f"📦 {len(all_cookie_files)} cookie set(s) — "
+                    f"{total_cookie_count} cookies\n"
+                    "Tip: re-run with a stricter keyword filter to shrink "
+                    "the result."
+                )
+                return
+
+            await _edit(
+                "📤 Uploading result...\n"
                 f"📦 {len(all_cookie_files)} cookie set(s) — "
                 f"{total_cookie_count} cookies\n"
-                "Tip: re-run with a stricter keyword filter to shrink "
-                "the result."
+                f"📡 zip: {_human_bytes(zip_size)}\n"
+                f"⏱️ Elapsed: {elapsed}s"
             )
-            return
-
-        await _edit(
-            "📤 Uploading result...\n"
-            f"📦 {len(all_cookie_files)} cookie set(s) — "
-            f"{total_cookie_count} cookies\n"
-            f"📡 zip: {_human_bytes(zip_size)}\n"
-            f"⏱️ Elapsed: {elapsed}s"
-        )
-        with open(zip_path, "rb") as f:
-            await context.bot.send_document(
-                chat_id=chat_id,
-                document=f,
-                filename=zip_path.name,
-                caption=(
-                    f"✅ {len(all_cookie_files)} cookie set(s) — "
-                    f"{total_cookie_count} cookies\n"
-                    f"📡 read: {_human_bytes(total_bytes_read)} "
-                    f"({_human_speed(speed)})\n"
-                    f"⏱️ {elapsed}s"
-                ),
+            with open(zip_path, "rb") as f:
+                await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=f,
+                    filename=zip_path.name,
+                    caption=(
+                        f"✅ {len(all_cookie_files)} cookie set(s) — "
+                        f"{total_cookie_count} cookies\n"
+                        f"📡 read: {_human_bytes(total_bytes_read)} "
+                        f"({_human_speed(speed)})\n"
+                        f"⏱️ {elapsed}s"
+                    ),
+                )
+            await _edit(
+                f"✅ Done! Sent {_human_bytes(zip_size)} "
+                f"({len(all_cookie_files)} sets, "
+                f"{total_cookie_count} cookies).\n"
+                f"⚡ Avg speed: {_human_speed(speed)}"
             )
-        await _edit(
-            f"✅ Done! Sent {_human_bytes(zip_size)} "
-            f"({len(all_cookie_files)} sets, "
-            f"{total_cookie_count} cookies).\n"
-            f"⚡ Avg speed: {_human_speed(speed)}"
-        )
-        job_status = "success" if not errors else "partial"
-        _job_history.append(JobRecord(
-            user_id=user_id, username=username, urls=urls,
-            cookie_count=total_cookie_count, bytes_read=total_bytes_read,
-            elapsed=elapsed, status=job_status,
-        ))
+            job_status = "success" if not errors else "partial"
+            _job_history.append(JobRecord(
+                user_id=user_id, username=username, urls=urls,
+                cookie_count=total_cookie_count, bytes_read=total_bytes_read,
+                elapsed=elapsed, status=job_status,
+            ))
     finally:
         _active_jobs.pop(user_id, None)
         context.user_data.clear()

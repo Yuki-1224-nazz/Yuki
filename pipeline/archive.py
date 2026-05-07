@@ -42,9 +42,10 @@ MAGIC_SIGNATURES: tuple[tuple[str, bytes], ...] = (
     ("rar", b"Rar!\x1a\x07"),
 )
 
-# All 7z-family binaries the bot will accept. ``7z`` is the canonical
-# one on Linux nixpkgs; macOS Homebrew installs ``7zz``.
-SEVENZIP_BINARIES: tuple[str, ...] = ("7z", "7za", "7zz")
+# Prefer ``7zz`` (modern 7-Zip for Linux, supports ZSTD and all
+# modern compression methods) over ``7z`` (legacy p7zip, which chokes
+# on newer ZIP methods).  macOS Homebrew also installs ``7zz``.
+SEVENZIP_BINARIES: tuple[str, ...] = ("7zz", "7z", "7za")
 UNRAR_BINARIES: tuple[str, ...] = ("unrar",)
 UNZIP_BINARIES: tuple[str, ...] = ("unzip",)
 

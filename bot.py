@@ -294,19 +294,20 @@ def _parse_passwords(text: str, num_urls: int) -> list[Optional[str]]:
     """Parse comma-separated passwords and align them with URLs.
 
     Rules:
-    - One password supplied → reuse it for every URL.
-    - N passwords supplied (N == num_urls) → map 1-to-1.
-    - Fewer or more passwords than URLs → map by index; extras are
-      dropped, missing ones default to ``None``.
-    - Empty / whitespace-only tokens are treated as *no password*.
+    - Single URL → the *entire* text is the password (no splitting).
+    - Multiple URLs with comma-separated passwords → map 1-to-1.
+    - One password for multiple URLs → reuse for all.
+    - Fewer passwords than URLs → remaining get ``None``.
+    - Only genuinely empty tokens are treated as no password.
     """
+    # Single URL: never split — the whole text is the password.
+    if num_urls <= 1:
+        return [text] if text else [None]
+
     raw_parts = [p.strip() for p in text.split(",")]
     passwords: list[Optional[str]] = []
     for p in raw_parts:
-        if not p or p.lower() in ("none", "-", "skip"):
-            passwords.append(None)
-        else:
-            passwords.append(p)
+        passwords.append(p if p else None)
 
     if len(passwords) == 1:
         return passwords * num_urls
@@ -321,7 +322,8 @@ def _parse_passwords(text: str, num_urls: int) -> list[Optional[str]]:
 async def on_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Phase 2b — INPUT. User just answered the password prompt."""
     text = (update.message.text or "").strip()
-    num_urls = len(context.user_data.get("urls") or [1])
+    urls = context.user_data.get("urls") or []
+    num_urls = len(urls) or 1
     if text.startswith("/"):
         if text.lower().startswith("/skip"):
             context.user_data["passwords"] = [None] * num_urls
@@ -329,7 +331,7 @@ async def on_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             return await cmd_cancel(update, context)
         else:
             return await cmd_cancel(update, context)
-    elif text.lower() in ("none", "-", "skip", ""):
+    elif not text:
         context.user_data["passwords"] = [None] * num_urls
     else:
         context.user_data["passwords"] = _parse_passwords(text, num_urls)
@@ -837,8 +839,8 @@ def _check_extractor_binaries() -> None:
         log.warning(
             "7z binary not found on PATH (looked for %s). "
             "All archive extraction (zip / 7z / rar) will fail at "
-            "runtime. Install p7zip-full on your host (Railway: see "
-            "railpack.json; Debian/Ubuntu: apt-get install p7zip-full).",
+            "runtime. Install 7zip (apt-get install 7zip) or "
+            "p7zip-full on your host.",
             ", ".join(SEVENZIP_BINARIES),
         )
     else:

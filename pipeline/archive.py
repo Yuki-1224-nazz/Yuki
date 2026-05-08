@@ -33,7 +33,10 @@ from urllib.parse import urlparse
 
 log = logging.getLogger(__name__)
 
-ARCHIVE_SUFFIXES: tuple[str, ...] = (".zip", ".7z", ".rar")
+ARCHIVE_SUFFIXES: tuple[str, ...] = (
+    ".zip", ".7z", ".rar", ".tar", ".tar.gz", ".tgz",
+    ".tar.bz2", ".tbz2", ".tar.xz", ".txz",
+)
 
 MAGIC_SIGNATURES: tuple[tuple[str, bytes], ...] = (
     ("zip", b"PK\x03\x04"),
@@ -41,6 +44,9 @@ MAGIC_SIGNATURES: tuple[tuple[str, bytes], ...] = (
     ("zip", b"PK\x07\x08"),
     ("7z", b"7z\xbc\xaf\x27\x1c"),
     ("rar", b"Rar!\x1a\x07"),
+    ("gz", b"\x1f\x8b"),
+    ("bz2", b"BZ"),
+    ("xz", b"\xfd7zXZ\x00"),
 )
 
 # Prefer ``7zz`` (modern 7-Zip for Linux, supports ZSTD and all
@@ -127,8 +133,18 @@ def is_archive_url(url: str) -> bool:
 
 
 def archive_kind(path: Path) -> Optional[str]:
-    """Return ``"zip"`` / ``"7z"`` / ``"rar"`` based on extension."""
+    """Return archive type based on extension."""
     name = path.name.lower()
+    # Check tar variants first (multi-part extensions)
+    tar_map = {
+        ".tar.gz": "gz", ".tgz": "gz",
+        ".tar.bz2": "bz2", ".tbz2": "bz2",
+        ".tar.xz": "xz", ".txz": "xz",
+        ".tar": "tar",
+    }
+    for suf, kind in tar_map.items():
+        if name.endswith(suf):
+            return kind
     for suf in ARCHIVE_SUFFIXES:
         if name.endswith(suf):
             return suf.lstrip(".")
@@ -144,7 +160,7 @@ def _read_magic_header(path: Path, n: int = 8) -> bytes:
 
 
 def detect_archive_kind(path: Path) -> Optional[str]:
-    """Return the archive kind for ``path`` (``"zip"``/``"7z"``/``"rar"``).
+    """Return the archive kind for ``path``.
 
     Magic bytes are checked first so the bot accepts archives served
     behind opaque CDN URLs (no ``.zip``/``.7z``/``.rar`` suffix in the
@@ -156,6 +172,13 @@ def detect_archive_kind(path: Path) -> Optional[str]:
         if header.startswith(prefix):
             return kind
     return archive_kind(path)
+
+
+def _is_tar_archive(path: Path) -> bool:
+    """Check if a file is a tar archive (including compressed tar)."""
+    name = path.name.lower()
+    tar_suffixes = (".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")
+    return any(name.endswith(s) for s in tar_suffixes)
 
 
 def _which_first(candidates: Sequence[str]) -> Optional[str]:
@@ -177,14 +200,27 @@ def _which_all(candidates: Sequence[str]) -> list[str]:
 
 
 def _is_wrong_password(output: str) -> bool:
-    """Detect wrong-password errors across 7z/unrar/unzip output."""
+    """Detect wrong-password errors from extractor output.
+
+    Only returns True for UNAMBIGUOUS wrong-password signals.
+    7z often outputs "Wrong password?" as a GUESS when it fails for
+    other reasons (e.g. can't decode RAR5), so we require the message
+    to NOT end with "?" (which indicates a guess, not a definitive error).
+    """
     low = output.lower()
-    return (
-        "wrong password" in low
-        or "incorrect password" in low
-        or "password is incorrect" in low
-        or ("crc failed" in low and "wrong password" in low)
-    )
+    # unrar: "Incorrect password for ..."
+    if "incorrect password" in low:
+        return True
+    # unrar: "The specified password is incorrect"
+    if "password is incorrect" in low:
+        return True
+    # 7z definitive: "Wrong password" (without trailing ?)
+    # But ignore 7z's guess: "Wrong password?"
+    if "wrong password" in low:
+        # Check if it's 7z's guess format (ends with ?)
+        if "wrong password?" not in low:
+            return True
+    return False
 
 
 def _dest_has_real_files(dest_dir: Path) -> bool:
@@ -357,6 +393,26 @@ def _extract_with_unrar(
     return _run_extractor(cmd, timeout)
 
 
+def _extract_with_tar(
+    archive_path: Path,
+    dest_dir: Path,
+    timeout: int,
+) -> Optional[subprocess.CompletedProcess[str]]:
+    """Extract tar/tar.gz/tar.bz2/tar.xz archives using Python tarfile."""
+    import tarfile as _tarfile
+    try:
+        with _tarfile.open(str(archive_path)) as tf:
+            tf.extractall(path=str(dest_dir))
+        return subprocess.CompletedProcess(
+            args=["tarfile"], returncode=0, stdout="", stderr="",
+        )
+    except Exception as exc:
+        log.warning("tarfile extraction failed: %s", exc)
+        return subprocess.CompletedProcess(
+            args=["tarfile"], returncode=1, stdout="", stderr=str(exc),
+        )
+
+
 # ── Dispatcher helpers ─────────────────────────────────────────────
 
 
@@ -367,21 +423,16 @@ def _check_proc_result(
 ) -> Optional[str]:
     """Return ``None`` on success, or an error string on failure.
 
-    Success means rc 0 **or** rc 1 with real (non-zero-byte) files.
+    Success means real (non-zero-byte) files were extracted, regardless
+    of exit code.  Wrong-password is only raised when NO files were
+    produced AND the output clearly indicates a password problem.
     """
     if proc is None:
         return f"{label} not available"
-    output = (proc.stderr or proc.stdout or "").strip()
-    if _is_wrong_password(output):
-        raise ArchiveError(
-            "wrong password — the archive is encrypted and the "
-            "password you provided didn't work. Please check "
-            "and try again with /start."
-        )
-    # Accept ANY exit code as long as real (non-zero-byte) files were
-    # actually extracted.  Extractors often return non-zero for partial
-    # success (e.g. 7z rc=1 = warnings, unrar rc=9 = disk-full but
-    # many files already extracted, etc.).
+
+    # FIRST: check if real files were extracted — if yes, password was
+    # correct regardless of what the output says (extractors often
+    # print misleading messages for partial success).
     if _dest_has_real_files(dest_dir):
         if proc.returncode != 0:
             log.info(
@@ -390,6 +441,15 @@ def _check_proc_result(
                 label, proc.returncode,
             )
         return None
+
+    # No files extracted — check if it's a password issue
+    output = (proc.stderr or proc.stdout or "").strip()
+    if _is_wrong_password(output):
+        raise ArchiveError(
+            "wrong password — the archive is encrypted and the "
+            "password you provided didn't work. Please check "
+            "and try again with /start."
+        )
     return output or f"{label} failed (rc={proc.returncode})"
 
 
@@ -407,18 +467,24 @@ def extract_archive(
 
     Returns ``dest_dir``. Raises :class:`ArchiveError` on any failure.
 
-    The extraction order depends on the archive type:
+    Supports all major archive formats:
 
     **RAR**: unrar → 7zz/7z (all binaries)
     **ZIP**: 7zz/7z (all binaries) → Python zipfile → unzip
     **7z** : 7zz/7z (all binaries)
+    **tar/gz/bz2/xz**: Python tarfile → 7zz/7z
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
     kind = detect_archive_kind(archive_path)
+
+    # For tar-like formats detected by magic or suffix
+    if kind in ("gz", "bz2", "xz") or _is_tar_archive(archive_path):
+        kind = "tar"
+
     if kind is None:
         raise ArchiveError(
             f"unsupported archive type: {archive_path.name} "
-            "(magic bytes don't match zip/7z/rar)"
+            "(magic bytes don't match zip/7z/rar/tar)"
         )
 
     archive_size = archive_path.stat().st_size
@@ -477,9 +543,11 @@ def extract_archive(
             ) from exc
 
         # Python zipfile — skip for large or encrypted archives
-        if archive_size <= _PYTHON_ZIP_MAX_BYTES and not password:
+        if archive_size <= _PYTHON_ZIP_MAX_BYTES:
             try:
                 log.info("falling back to Python zipfile")
+                shutil.rmtree(dest_dir, ignore_errors=True)
+                dest_dir.mkdir(parents=True, exist_ok=True)
                 _extract_with_python_zipfile(
                     archive_path, dest_dir, password,
                 )
@@ -507,8 +575,22 @@ def extract_archive(
                 f"extraction timed out after {timeout}s"
             ) from exc
 
-    else:
-        # ── 7z format: only 7z binaries ──
+    elif kind == "tar":
+        # ── TAR (gz/bz2/xz): Python tarfile → 7z ──
+        try:
+            proc = _extract_with_tar(archive_path, dest_dir, timeout)
+            err = _check_proc_result(proc, dest_dir, "tarfile")
+            if err is None:
+                return dest_dir
+            errors.append(err)
+        except subprocess.TimeoutExpired as exc:
+            raise ArchiveError(
+                f"extraction timed out after {timeout}s"
+            ) from exc
+
+        # Fallback to 7z for tar archives
+        shutil.rmtree(dest_dir, ignore_errors=True)
+        dest_dir.mkdir(parents=True, exist_ok=True)
         try:
             proc = _extract_with_7z_all(
                 archive_path, dest_dir, password, timeout,
@@ -517,6 +599,38 @@ def extract_archive(
             if err is None:
                 return dest_dir
             errors.append(err)
+        except subprocess.TimeoutExpired as exc:
+            raise ArchiveError(
+                f"extraction timed out after {timeout}s"
+            ) from exc
+
+    else:
+        # ── 7z / unknown: try 7z binaries, then unrar ──
+        try:
+            proc = _extract_with_7z_all(
+                archive_path, dest_dir, password, timeout,
+            )
+            err = _check_proc_result(proc, dest_dir, "7z")
+            if err is None:
+                return dest_dir
+            errors.append(err)
+        except subprocess.TimeoutExpired as exc:
+            raise ArchiveError(
+                f"extraction timed out after {timeout}s"
+            ) from exc
+
+        # Try unrar as last resort for unknown formats
+        shutil.rmtree(dest_dir, ignore_errors=True)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            proc = _extract_with_unrar(
+                archive_path, dest_dir, password, timeout,
+            )
+            err = _check_proc_result(proc, dest_dir, "unrar")
+            if err is None:
+                return dest_dir
+            if err:
+                errors.append(err)
         except subprocess.TimeoutExpired as exc:
             raise ArchiveError(
                 f"extraction timed out after {timeout}s"

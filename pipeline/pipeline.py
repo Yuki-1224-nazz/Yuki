@@ -124,6 +124,9 @@ def _zip_results(zip_path: Path, files: Sequence[Path], root: Path) -> None:
             z.write(p, arcname=p.relative_to(root).as_posix())
 
 
+_MAX_LABEL_LEN = 80
+
+
 def _label_for(src: Path, archive_root: Path) -> str:
     """Build a human-readable filename from the source path inside the archive."""
     try:
@@ -132,11 +135,14 @@ def _label_for(src: Path, archive_root: Path) -> str:
         rel = Path(src.name)
     parts = [_safe_name(p) for p in rel.parts if p not in (".", "")]
     if not parts:
-        return _safe_name(src.stem)
+        return _safe_name(src.stem)[:_MAX_LABEL_LEN]
     label = "__".join(parts)
     if label.lower().endswith(".txt"):
         label = label[:-4]
-    return label or _safe_name(src.stem)
+    label = label or _safe_name(src.stem)
+    if len(label) > _MAX_LABEL_LEN:
+        label = label[:_MAX_LABEL_LEN]
+    return label
 
 
 def _process_cookie_source(

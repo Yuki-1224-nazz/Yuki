@@ -583,28 +583,56 @@ async def _run_job(
                     for p in kw_cookie_files:
                         z.write(p, arcname=p.relative_to(kw_dir).as_posix())
                 kw_zip_size = kw_zip.stat().st_size
-                if kw_zip_size > DOC_UPLOAD_LIMIT:
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=(
-                            f"❌ `{kw}_Cookies.zip` is too large "
-                            f"({_human_bytes(kw_zip_size)} > "
-                            f"{_human_bytes(DOC_UPLOAD_LIMIT)})."
-                        ),
-                        parse_mode=ParseMode.MARKDOWN,
+                if kw_zip_size <= DOC_UPLOAD_LIMIT:
+                    with open(kw_zip, "rb") as f:
+                        await context.bot.send_document(
+                            chat_id=chat_id,
+                            document=f,
+                            filename=kw_zip.name,
+                            caption=(
+                                f"🔑 {kw} — {len(kw_cookie_files)} set(s), "
+                                f"{kw_count} cookies"
+                            ),
+                        )
+                    sent_count += 1
+                else:
+                    # Split per-keyword zip into parts
+                    tgt = int(DOC_UPLOAD_LIMIT * 0.8)
+                    fpp = max(
+                        1,
+                        int(len(kw_cookie_files) * tgt / kw_zip_size),
                     )
-                    continue
-                with open(kw_zip, "rb") as f:
-                    await context.bot.send_document(
-                        chat_id=chat_id,
-                        document=f,
-                        filename=kw_zip.name,
-                        caption=(
-                            f"🔑 {kw} — {len(kw_cookie_files)} set(s), "
-                            f"{kw_count} cookies"
-                        ),
-                    )
-                sent_count += 1
+                    for ps in range(0, len(kw_cookie_files), fpp):
+                        pf = kw_cookie_files[ps:ps + fpp]
+                        pi = ps // fpp
+                        pn = (
+                            f"{kw}_Cookies.zip" if pi == 0
+                            else f"{kw}_Cookies_{pi}.zip"
+                        )
+                        pp = kw_dir / pn
+                        with zipfile.ZipFile(
+                            pp, "w",
+                            compression=zipfile.ZIP_DEFLATED,
+                            compresslevel=1,
+                        ) as z:
+                            for p in pf:
+                                z.write(
+                                    p,
+                                    arcname=p.relative_to(kw_dir).as_posix(),
+                                )
+                        if pp.stat().st_size > DOC_UPLOAD_LIMIT:
+                            continue
+                        with open(pp, "rb") as f:
+                            await context.bot.send_document(
+                                chat_id=chat_id,
+                                document=f,
+                                filename=pn,
+                                caption=(
+                                    f"🔑 {kw} part {pi + 1} — "
+                                    f"{len(pf)} set(s)"
+                                ),
+                            )
+                        sent_count += 1
             elapsed = int(time.time() - started)
             await _edit(
                 f"✅ Done! Sent {sent_count} keyword zip(s) "
@@ -618,7 +646,8 @@ async def _run_job(
                 elapsed=elapsed, status=job_status,
             ))
         else:
-            # --- Single zip (0 or 1 keyword) ---
+            # --- Single or split zip (0 or 1 keyword) ---
+            # Build one zip first; if too large, split into parts
             zip_path = output_dir / "cookies_result.zip"
             with zipfile.ZipFile(
                 zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1,
@@ -628,44 +657,99 @@ async def _run_job(
 
             zip_size = zip_path.stat().st_size
 
-            if zip_size > DOC_UPLOAD_LIMIT:
+            if zip_size <= DOC_UPLOAD_LIMIT:
+                # Single zip fits — send it
                 await _edit(
-                    f"❌ Result zip is too large for Telegram "
-                    f"({_human_bytes(zip_size)} > "
-                    f"{_human_bytes(DOC_UPLOAD_LIMIT)}).\n"
+                    "📤 Uploading result...\n"
                     f"📦 {len(all_cookie_files)} cookie set(s) — "
                     f"{total_cookie_count} cookies\n"
-                    "Tip: re-run with a stricter keyword filter to shrink "
-                    "the result."
+                    f"📡 zip: {_human_bytes(zip_size)}\n"
+                    f"⏱️ Elapsed: {elapsed}s"
                 )
-                return
+                with open(zip_path, "rb") as f:
+                    await context.bot.send_document(
+                        chat_id=chat_id,
+                        document=f,
+                        filename=zip_path.name,
+                        caption=(
+                            f"✅ {len(all_cookie_files)} cookie set(s) — "
+                            f"{total_cookie_count} cookies\n"
+                            f"📡 read: {_human_bytes(total_bytes_read)} "
+                            f"({_human_speed(speed)})\n"
+                            f"⏱️ {elapsed}s"
+                        ),
+                    )
+                await _edit(
+                    f"✅ Done! Sent {_human_bytes(zip_size)} "
+                    f"({len(all_cookie_files)} sets, "
+                    f"{total_cookie_count} cookies).\n"
+                    f"⚡ Avg speed: {_human_speed(speed)}"
+                )
+            else:
+                # Zip too large — split into multiple parts
+                await _edit(
+                    f"📦 Result too large for one file "
+                    f"({_human_bytes(zip_size)}). "
+                    "Splitting into parts..."
+                )
+                # Target ~40 MB per part to stay under 50 MB limit
+                target_part_size = int(DOC_UPLOAD_LIMIT * 0.8)
+                files_per_part = max(
+                    1,
+                    int(len(all_cookie_files) * target_part_size / zip_size),
+                )
+                parts_sent = 0
+                for part_start in range(0, len(all_cookie_files), files_per_part):
+                    part_files = all_cookie_files[
+                        part_start:part_start + files_per_part
+                    ]
+                    part_idx = part_start // files_per_part
+                    if part_idx == 0:
+                        part_name = "cookies_result.zip"
+                    else:
+                        part_name = f"cookies_result_{part_idx}.zip"
+                    part_path = output_dir / part_name
+                    with zipfile.ZipFile(
+                        part_path, "w",
+                        compression=zipfile.ZIP_DEFLATED, compresslevel=1,
+                    ) as z:
+                        for p in part_files:
+                            z.write(
+                                p,
+                                arcname=p.relative_to(output_dir).as_posix(),
+                            )
+                    part_size = part_path.stat().st_size
+                    if part_size > DOC_UPLOAD_LIMIT:
+                        # Still too large — skip with message
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=(
+                                f"⚠️ Part `{part_name}` is still too large "
+                                f"({_human_bytes(part_size)}), skipping."
+                            ),
+                            parse_mode=ParseMode.MARKDOWN,
+                        )
+                        continue
+                    with open(part_path, "rb") as f:
+                        await context.bot.send_document(
+                            chat_id=chat_id,
+                            document=f,
+                            filename=part_name,
+                            caption=(
+                                f"📦 Part {part_idx + 1} — "
+                                f"{len(part_files)} set(s), "
+                                f"{_human_bytes(part_size)}"
+                            ),
+                        )
+                    parts_sent += 1
 
-            await _edit(
-                "📤 Uploading result...\n"
-                f"📦 {len(all_cookie_files)} cookie set(s) — "
-                f"{total_cookie_count} cookies\n"
-                f"📡 zip: {_human_bytes(zip_size)}\n"
-                f"⏱️ Elapsed: {elapsed}s"
-            )
-            with open(zip_path, "rb") as f:
-                await context.bot.send_document(
-                    chat_id=chat_id,
-                    document=f,
-                    filename=zip_path.name,
-                    caption=(
-                        f"✅ {len(all_cookie_files)} cookie set(s) — "
-                        f"{total_cookie_count} cookies\n"
-                        f"📡 read: {_human_bytes(total_bytes_read)} "
-                        f"({_human_speed(speed)})\n"
-                        f"⏱️ {elapsed}s"
-                    ),
+                await _edit(
+                    f"✅ Done! Sent {parts_sent} zip part(s) "
+                    f"({len(all_cookie_files)} sets, "
+                    f"{total_cookie_count} cookies).\n"
+                    f"⚡ Avg speed: {_human_speed(speed)}"
                 )
-            await _edit(
-                f"✅ Done! Sent {_human_bytes(zip_size)} "
-                f"({len(all_cookie_files)} sets, "
-                f"{total_cookie_count} cookies).\n"
-                f"⚡ Avg speed: {_human_speed(speed)}"
-            )
+
             job_status = "success" if not errors else "partial"
             _job_history.append(JobRecord(
                 user_id=user_id, username=username, urls=urls,

@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time as _time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -250,12 +251,36 @@ async def async_run_pipeline(
         extraction_timeout = max(600, int(600 + (dl_size_mb / 100) * 60))
 
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
+        extract_start = _time.time()
+        extraction_future = loop.run_in_executor(
             None, lambda: extract_archive(
                 download_path, extracted,
                 password=password, timeout=extraction_timeout,
             )
         )
+
+        # Show live progress updates while extraction runs
+        while not extraction_future.done():
+            await asyncio.sleep(8)
+            if extraction_future.done():
+                break
+            elapsed = int(_time.time() - extract_start)
+            file_count = 0
+            if extracted.exists():
+                try:
+                    file_count = sum(
+                        1 for p in extracted.rglob("*") if p.is_file()
+                    )
+                except OSError:
+                    pass
+            status(
+                f"⚙ Extracting {kind} archive ({dl_size_mb:.0f} MB)...\n"
+                f"📂 {file_count:,} files extracted\n"
+                f"⏱️ {elapsed}s elapsed"
+            )
+
+        # Await the result (re-raises any exception)
+        await extraction_future
 
         status("⚙ Processing... (scanning extracted files)")
         sources = await loop.run_in_executor(None, lambda: _find_cookie_files(extracted))

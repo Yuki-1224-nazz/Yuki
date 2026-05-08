@@ -65,49 +65,58 @@ def _ensure_unrar() -> Optional[str]:
     """Return the path to ``unrar``, downloading it if needed.
 
     If ``unrar`` is already on PATH, return it immediately.  Otherwise
-    download the official Linux x64 static binary from rarlab.com to
-    ``~/.local/bin/unrar`` and return that path.  Returns ``None`` if
-    download fails or the platform is not Linux x64.
+    download the official Linux x64 static binary from rarlab.com and
+    cache it locally.  Returns ``None`` if download fails or platform
+    is not Linux x64.
     """
     existing = shutil.which("unrar")
     if existing:
         return existing
 
-    local_unrar = _UNRAR_LOCAL_DIR / "unrar"
-    if local_unrar.is_file():
-        return str(local_unrar)
+    # Check common cached locations
+    for candidate_dir in (_UNRAR_LOCAL_DIR, Path("/tmp/.unrar_bin")):
+        candidate = candidate_dir / "unrar"
+        if candidate.is_file():
+            return str(candidate)
 
     if platform.system() != "Linux" or platform.machine() not in ("x86_64", "AMD64"):
         log.warning("auto-download of unrar only supported on Linux x64")
         return None
 
     log.info("unrar not found — downloading from rarlab.com ...")
-    try:
-        import tarfile
-        import tempfile
-        import urllib.request
 
-        _UNRAR_LOCAL_DIR.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
-            tmp_path = tmp.name
-            urllib.request.urlretrieve(_UNRAR_URL, tmp_path)
+    # Try multiple target dirs in case some are read-only
+    target_dirs = [_UNRAR_LOCAL_DIR, Path("/tmp/.unrar_bin")]
+    for target_dir in target_dirs:
+        try:
+            import tarfile
+            import tempfile
+            import urllib.request
 
-        with tarfile.open(tmp_path, "r:gz") as tf:
-            for member in tf.getmembers():
-                if member.name.endswith("/unrar") or member.name == "unrar":
-                    member.name = "unrar"
-                    tf.extract(member, path=str(_UNRAR_LOCAL_DIR))
-                    break
+            target_dir.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
+                tmp_path = tmp.name
+                urllib.request.urlretrieve(_UNRAR_URL, tmp_path)
 
-        os.unlink(tmp_path)
-        local_unrar.chmod(local_unrar.stat().st_mode | stat.S_IEXEC)
+            target_bin = target_dir / "unrar"
+            with tarfile.open(tmp_path, "r:gz") as tf:
+                for member in tf.getmembers():
+                    if member.name.endswith("/unrar") or member.name == "unrar":
+                        member.name = "unrar"
+                        tf.extract(member, path=str(target_dir))
+                        break
 
-        if local_unrar.is_file():
-            log.info("unrar installed to %s", local_unrar)
-            return str(local_unrar)
-    except Exception:
-        log.exception("failed to download unrar")
+            os.unlink(tmp_path)
+            target_bin.chmod(target_bin.stat().st_mode | stat.S_IEXEC)
 
+            if target_bin.is_file():
+                log.info("unrar installed to %s", target_bin)
+                return str(target_bin)
+        except Exception:
+            log.warning("failed to install unrar to %s", target_dir, exc_info=True)
+            continue
+
+    log.error("could not install unrar to any location")
     return None
 
 
@@ -172,9 +181,9 @@ def _is_wrong_password(output: str) -> bool:
     low = output.lower()
     return (
         "wrong password" in low
-        or "crc failed" in low
-        or "encrypted" in low
         or "incorrect password" in low
+        or "password is incorrect" in low
+        or ("crc failed" in low and "wrong password" in low)
     )
 
 
@@ -202,6 +211,7 @@ def _run_extractor(
     """
     proc = subprocess.run(
         cmd, capture_output=True, timeout=timeout, check=False,
+        stdin=subprocess.DEVNULL,
     )
     return subprocess.CompletedProcess(
         args=proc.args,
@@ -515,5 +525,16 @@ def extract_archive(
     # All attempts failed
     last_error = errors[-1] if errors else "all extraction methods failed"
     lines = last_error.splitlines()
-    tail = lines[-1] if lines else last_error
+    # Find most informative error line (skip empty/generic lines)
+    tail = ""
+    for line in reversed(lines):
+        stripped = line.strip()
+        if stripped and "---" not in stripped:
+            tail = stripped
+            break
+    if not tail:
+        tail = lines[-1] if lines else last_error
+    # Truncate very long error messages for Telegram display
+    if len(tail) > 200:
+        tail = tail[:200] + "..."
     raise ArchiveError(f"extraction failed: {tail}")

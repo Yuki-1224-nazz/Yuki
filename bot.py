@@ -54,7 +54,7 @@ from telegram.ext import (
 )
 
 from pipeline import async_run_pipeline
-from pipeline.archive import SEVENZIP_BINARIES
+from pipeline.archive import SEVENZIP_BINARIES, _ensure_unrar
 from pipeline.cookies import iter_cookies_from_lines, write_netscape_file
 
 load_dotenv()
@@ -70,9 +70,9 @@ DOC_UPLOAD_LIMIT = int(os.getenv("DOC_UPLOAD_LIMIT", str(50 * 1024 * 1024)))
 MAX_DOWNLOAD_BYTES = int(
     os.getenv("MAX_DOWNLOAD_BYTES", str(5 * 1024 * 1024 * 1024))
 )
-DOWNLOAD_CONNECTIONS = int(os.getenv("DOWNLOAD_CONNECTIONS", "16"))
+DOWNLOAD_CONNECTIONS = int(os.getenv("DOWNLOAD_CONNECTIONS", "32"))
 
-BOT_VERSION = "2.2.0"
+BOT_VERSION = "2.3.0"
 _BOOT_TIME = time.time()
 
 
@@ -244,7 +244,31 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await cmd_start(update, context)
+    """Show all available commands."""
+    if not _is_admin(update):
+        await _deny_access(update)
+        return ConversationHandler.END
+
+    text = (
+        "📋 *Available Commands*\n\n"
+        "🔹 /start — Start cookie extraction flow\n"
+        "🔹 /help — Show this command list\n"
+        "🔹 /skip — Skip password or keywords prompt\n"
+        "🔹 /cancel — Cancel current job\n"
+        "🔹 /status — Check if a job is running\n"
+        "🔹 /settings — View bot configuration\n"
+        "🔹 /history — Last 10 completed jobs\n"
+        "🔹 /connections — View/set parallel downloads (1–64)\n"
+        "🔹 /info — Bot version, uptime, stats\n"
+        "\n"
+        "💡 *Tips:*\n"
+        "• Send multiple links (comma/space separated)\n"
+        "• One password works for all links with same password\n"
+        "• Multiple keywords → separate zip per keyword\n"
+        "• Supports ZIP, 7z, RAR (including RAR5)\n"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    return ConversationHandler.END
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -678,7 +702,11 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not _is_admin(update):
         await _deny_access(update)
         return
-    sevenzip = shutil.which("7z") or shutil.which("7za") or "not found"
+    sevenzip = (
+        shutil.which("7zz") or shutil.which("7z") or shutil.which("7za")
+        or "not found"
+    )
+    unrar = _ensure_unrar() or "not found"
     text = (
         "\u2699\ufe0f *Bot Settings*\n\n"
         f"\u2022 Max download size: `{_human_bytes(MAX_DOWNLOAD_BYTES)}`\n"
@@ -686,6 +714,7 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"\u2022 Download connections: `{DOWNLOAD_CONNECTIONS}`\n"
         f"\u2022 Admin IDs: `{', '.join(str(i) for i in ADMIN_IDS) or 'everyone'}`\n"
         f"\u2022 7z binary: `{sevenzip}`\n"
+        f"\u2022 unrar binary: `{unrar}`\n"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
@@ -826,7 +855,7 @@ def build_app() -> Application:
 
 
 def _check_extractor_binaries() -> None:
-    """Warn loudly at startup if the archive extractor isn't on PATH."""
+    """Ensure extraction tools are available at startup."""
     def _first_on_path(candidates: Sequence[str]) -> Optional[str]:
         for c in candidates:
             p = shutil.which(c)
@@ -846,12 +875,22 @@ def _check_extractor_binaries() -> None:
     else:
         log.info("7z binary OK: %s (handles zip, 7z, rar)", sevenzip)
 
+    # Pre-download unrar so RAR5 extraction doesn't delay the first job
+    unrar_path = _ensure_unrar()
+    if unrar_path:
+        log.info("unrar binary OK: %s (handles RAR5)", unrar_path)
+    else:
+        log.warning(
+            "unrar binary not available — RAR5 archives may fail to "
+            "extract. 7z will be tried as fallback."
+        )
+
 
 async def _post_init(application: Application) -> None:
     """Register the bot menu commands after the application starts."""
     await application.bot.set_my_commands([
         BotCommand("start", "Start the bot"),
-        BotCommand("help", "Show help"),
+        BotCommand("help", "Show all commands"),
         BotCommand("status", "Check current job status"),
         BotCommand("settings", "View bot configuration"),
         BotCommand("history", "Recent job history"),

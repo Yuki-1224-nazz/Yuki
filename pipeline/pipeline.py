@@ -246,9 +246,15 @@ async def async_run_pipeline(
         )
         extracted = workdir / "extracted"
 
+        # Scale timeout with archive size (min 600s, +60s per 100 MB)
+        extraction_timeout = max(600, int(600 + (dl_size_mb / 100) * 60))
+
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
-            None, lambda: extract_archive(download_path, extracted, password=password)
+            None, lambda: extract_archive(
+                download_path, extracted,
+                password=password, timeout=extraction_timeout,
+            )
         )
 
         status("⚙ Processing... (scanning extracted files)")
@@ -261,7 +267,8 @@ async def async_run_pipeline(
 
             # Process cookie files concurrently for large archives
             if len(sources) > 10:
-                with ThreadPoolExecutor(max_workers=4) as pool:
+                workers = min(8, max(4, len(sources) // 100))
+                with ThreadPoolExecutor(max_workers=workers) as pool:
                     futures = []
                     for i, src in enumerate(sources, start=1):
                         futures.append(

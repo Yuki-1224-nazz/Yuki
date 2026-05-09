@@ -74,27 +74,41 @@ def _safe_name(name: str) -> str:
     return cleaned or "cookies"
 
 
+def _is_cookie_file(p: Path) -> bool:
+    """Check if a single file is a cookie file (for parallel use)."""
+    lname = p.name.lower()
+    if any(h in lname for h in COOKIE_FILENAME_HINTS):
+        return True
+    if lname.endswith(".txt"):
+        try:
+            with open(p, "rb") as f:
+                # Read only first 4 KB to detect cookie format
+                head = f.read(4096).decode("utf-8", errors="replace")
+            for line in head.splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    if stripped.startswith("#HttpOnly_"):
+                        parts = stripped.split("\t")
+                        if len(parts) == 7:
+                            return True
+                    continue
+                return parse_cookie_line(line) is not None
+        except OSError:
+            pass
+    return False
+
+
 def _find_cookie_files(root: Path) -> List[Path]:
-    out: List[Path] = []
-    for p in sorted(root.rglob("*")):
-        if not p.is_file():
-            continue
-        lname = p.name.lower()
-        if any(h in lname for h in COOKIE_FILENAME_HINTS):
-            out.append(p)
-            continue
-        if lname.endswith(".txt"):
-            try:
-                with open(p, "r", encoding="utf-8", errors="replace") as f:
-                    for line in f:
-                        if not line.strip() or line.lstrip().startswith("#"):
-                            continue
-                        if parse_cookie_line(line) is not None:
-                            out.append(p)
-                        break
-            except OSError:
-                continue
-    return out
+    # Collect all files first (no sorting — unnecessary overhead)
+    all_files = [p for p in root.rglob("*") if p.is_file()]
+    if len(all_files) <= 100:
+        return [p for p in all_files if _is_cookie_file(p)]
+    # Parallel scan for large archives
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+    workers = min(16, max(4, len(all_files) // 500))
+    with _TPE(max_workers=workers) as pool:
+        results = list(pool.map(_is_cookie_file, all_files))
+    return [p for p, is_cookie in zip(all_files, results) if is_cookie]
 
 
 def _extract_set(
@@ -103,9 +117,20 @@ def _extract_set(
     keywords: Optional[Sequence[str]],
 ) -> int:
     """Read one source cookies file and write one Netscape file out."""
+    # Read entire file at once (faster than line-by-line for small files)
+    try:
+        raw = src.read_bytes().decode("utf-8", errors="replace")
+    except OSError:
+        return 0
+    kw_list = [k for k in (keywords or []) if k and k.strip()]
     rows: List[CookieRow] = []
-    with open(src, "r", encoding="utf-8", errors="replace") as f:
-        for row in iter_cookies_from_lines(f, keywords=keywords):
+    for line in raw.splitlines():
+        if kw_list:
+            low = line.lower()
+            if not any(k.strip().lower() in low for k in kw_list):
+                continue
+        row = parse_cookie_line(line)
+        if row is not None:
             rows.append(row)
     if not rows:
         return 0
@@ -288,33 +313,24 @@ async def async_run_pipeline(
         # Await the result (re-raises any exception)
         await extraction_future
 
-        status("⚙ Processing... (scanning extracted files)")
+        scan_start = _time.time()
+        status("⚙ Scanning files...")
         sources = await loop.run_in_executor(None, lambda: _find_cookie_files(extracted))
+        scan_secs = _time.time() - scan_start
 
         if not sources:
             status("⚙ Processing... (no cookie files found)")
         else:
-            status(f"🔄 Converting... ({len(sources)} cookie set(s))")
+            status(
+                f"🔄 Converting {len(sources):,} cookie files "
+                f"(scan took {scan_secs:.1f}s)..."
+            )
 
-            # Process cookie files concurrently for large archives
-            if len(sources) > 10:
-                workers = min(8, max(4, len(sources) // 100))
-                with ThreadPoolExecutor(max_workers=workers) as pool:
-                    futures = []
-                    for i, src in enumerate(sources, start=1):
-                        futures.append(
-                            loop.run_in_executor(
-                                pool,
-                                _process_cookie_source,
-                                i, src, cookies_dir, extracted, keywords,
-                            )
-                        )
-                    results = await asyncio.gather(*futures)
-                    for path, count in results:
-                        if path is not None:
-                            result.cookie_files.append(path)
-                            result.cookie_count += count
-            else:
+            # Use many workers for large archives
+            workers = min(32, max(4, len(sources) // 50))
+            convert_start = _time.time()
+
+            if len(sources) <= 20:
                 for i, src in enumerate(sources, start=1):
                     path, count = _process_cookie_source(
                         i, src, cookies_dir, extracted, keywords
@@ -322,6 +338,38 @@ async def async_run_pipeline(
                     if path is not None:
                         result.cookie_files.append(path)
                         result.cookie_count += count
+            else:
+                # Process in batches with progress updates
+                batch_size = max(50, len(sources) // 10)
+                processed = 0
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    for batch_start in range(0, len(sources), batch_size):
+                        batch = sources[batch_start:batch_start + batch_size]
+                        futures = []
+                        for i, src in enumerate(
+                            batch, start=batch_start + 1
+                        ):
+                            futures.append(
+                                loop.run_in_executor(
+                                    pool,
+                                    _process_cookie_source,
+                                    i, src, cookies_dir, extracted,
+                                    keywords,
+                                )
+                            )
+                        batch_results = await asyncio.gather(*futures)
+                        for path, count in batch_results:
+                            if path is not None:
+                                result.cookie_files.append(path)
+                                result.cookie_count += count
+                        processed += len(batch)
+                        elapsed_conv = _time.time() - convert_start
+                        status(
+                            f"🔄 Converting... "
+                            f"{processed:,}/{len(sources):,} files "
+                            f"({result.cookie_count:,} cookies found, "
+                            f"{elapsed_conv:.0f}s)"
+                        )
     else:
         status("⚙ Processing... (parsing as plain cookie file)")
         rows: List[CookieRow] = []

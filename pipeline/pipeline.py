@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import time as _time
 import zipfile
@@ -79,34 +80,70 @@ def _is_cookie_file(p: Path) -> bool:
     lname = p.name.lower()
     if any(h in lname for h in COOKIE_FILENAME_HINTS):
         return True
-    if lname.endswith(".txt"):
+    if not lname.endswith(".txt"):
+        return False
+    # Read first 2 KB to detect cookie format (faster than 4 KB)
+    try:
+        fd = os.open(str(p), os.O_RDONLY)
         try:
-            with open(p, "rb") as f:
-                # Read only first 4 KB to detect cookie format
-                head = f.read(4096).decode("utf-8", errors="replace")
-            for line in head.splitlines():
-                stripped = line.strip()
-                if not stripped or stripped.startswith("#"):
-                    if stripped.startswith("#HttpOnly_"):
-                        parts = stripped.split("\t")
-                        if len(parts) == 7:
-                            return True
-                    continue
-                return parse_cookie_line(line) is not None
-        except OSError:
-            pass
+            head = os.read(fd, 2048).decode("utf-8", errors="replace")
+        finally:
+            os.close(fd)
+    except OSError:
+        return False
+    for line in head.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            if stripped.startswith("#HttpOnly_") and stripped.count("\t") == 6:
+                return True
+            continue
+        return parse_cookie_line(line) is not None
     return False
 
 
+def _fast_listdir(root: str) -> List[Path]:
+    """Recursively list files using os.scandir (3-5x faster than rglob)."""
+    result: List[Path] = []
+    stack = [root]
+    while stack:
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                for entry in it:
+                    if entry.is_file(follow_symlinks=False):
+                        result.append(Path(entry.path))
+                    elif entry.is_dir(follow_symlinks=False):
+                        stack.append(entry.path)
+        except OSError:
+            pass
+    return result
+
+
+def _fast_file_count(root: str) -> int:
+    """Count files using os.scandir (faster than rglob for progress)."""
+    count = 0
+    stack = [root]
+    while stack:
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                for entry in it:
+                    if entry.is_file(follow_symlinks=False):
+                        count += 1
+                    elif entry.is_dir(follow_symlinks=False):
+                        stack.append(entry.path)
+        except OSError:
+            pass
+    return count
+
+
 def _find_cookie_files(root: Path) -> List[Path]:
-    # Collect all files first (no sorting — unnecessary overhead)
-    all_files = [p for p in root.rglob("*") if p.is_file()]
+    all_files = _fast_listdir(str(root))
     if len(all_files) <= 100:
         return [p for p in all_files if _is_cookie_file(p)]
     # Parallel scan for large archives
-    from concurrent.futures import ThreadPoolExecutor as _TPE
     workers = min(16, max(4, len(all_files) // 500))
-    with _TPE(max_workers=workers) as pool:
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         results = list(pool.map(_is_cookie_file, all_files))
     return [p for p, is_cookie in zip(all_files, results) if is_cookie]
 
@@ -200,6 +237,7 @@ async def async_run_pipeline(
     on_status: Optional[StatusCallback] = None,
     on_progress: Optional[ProgressCallback] = None,
     num_connections: int = 8,
+    skip_zip: bool = False,
 ) -> PipelineResult:
     """Async version of run_pipeline — uses aiohttp for faster downloads.
 
@@ -292,18 +330,13 @@ async def async_run_pipeline(
 
         # Show live progress updates while extraction runs
         while not extraction_future.done():
-            await asyncio.sleep(8)
+            await asyncio.sleep(5)
             if extraction_future.done():
                 break
             elapsed = int(_time.time() - extract_start)
             file_count = 0
             if extracted.exists():
-                try:
-                    file_count = sum(
-                        1 for p in extracted.rglob("*") if p.is_file()
-                    )
-                except OSError:
-                    pass
+                file_count = _fast_file_count(str(extracted))
             status(
                 f"⚙ Extracting {kind} archive ({dl_size_mb:.0f} MB)...\n"
                 f"📂 {file_count:,} files extracted\n"
@@ -312,6 +345,12 @@ async def async_run_pipeline(
 
         # Await the result (re-raises any exception)
         await extraction_future
+
+        # Free disk: delete the downloaded archive now that it's extracted
+        try:
+            download_path.unlink()
+        except OSError:
+            pass
 
         scan_start = _time.time()
         status("⚙ Scanning files...")
@@ -326,7 +365,6 @@ async def async_run_pipeline(
                 f"(scan took {scan_secs:.1f}s)..."
             )
 
-            # Use many workers for large archives
             workers = min(32, max(4, len(sources) // 50))
             convert_start = _time.time()
 
@@ -339,25 +377,26 @@ async def async_run_pipeline(
                         result.cookie_files.append(path)
                         result.cookie_count += count
             else:
-                # Process in batches with progress updates
-                batch_size = max(50, len(sources) // 10)
+                # Submit ALL futures at once for maximum parallelism
                 processed = 0
                 with ThreadPoolExecutor(max_workers=workers) as pool:
-                    for batch_start in range(0, len(sources), batch_size):
-                        batch = sources[batch_start:batch_start + batch_size]
-                        futures = []
-                        for i, src in enumerate(
-                            batch, start=batch_start + 1
-                        ):
-                            futures.append(
-                                loop.run_in_executor(
-                                    pool,
-                                    _process_cookie_source,
-                                    i, src, cookies_dir, extracted,
-                                    keywords,
-                                )
-                            )
-                        batch_results = await asyncio.gather(*futures)
+                    all_futures = [
+                        loop.run_in_executor(
+                            pool,
+                            _process_cookie_source,
+                            i, src, cookies_dir, extracted, keywords,
+                        )
+                        for i, src in enumerate(sources, start=1)
+                    ]
+                    # Gather results as they complete with progress
+                    batch_size = max(200, len(sources) // 5)
+                    for batch_start in range(
+                        0, len(all_futures), batch_size
+                    ):
+                        batch = all_futures[
+                            batch_start : batch_start + batch_size
+                        ]
+                        batch_results = await asyncio.gather(*batch)
                         for path, count in batch_results:
                             if path is not None:
                                 result.cookie_files.append(path)
@@ -384,12 +423,13 @@ async def async_run_pipeline(
             result.cookie_files.append(out_path)
             result.cookie_count = len(rows)
 
-    # 4. Zip results
-    if result.cookie_files:
-        status(f"⚙ Processing... (packaging {len(result.cookie_files)} file(s))")
-        _zip_results(result.zip_path, result.cookie_files, output_dir)
-    else:
-        _zip_results(result.zip_path, [], output_dir)
+    # 4. Zip results (skip if caller handles zipping)
+    if not skip_zip:
+        if result.cookie_files:
+            status(f"⚙ Processing... (packaging {len(result.cookie_files)} file(s))")
+            _zip_results(result.zip_path, result.cookie_files, output_dir)
+        else:
+            _zip_results(result.zip_path, [], output_dir)
 
     return result
 

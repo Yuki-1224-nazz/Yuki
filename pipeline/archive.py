@@ -268,7 +268,7 @@ def _try_7z_binary(
     timeout: int,
 ) -> subprocess.CompletedProcess[str]:
     """Run a single 7z-family binary."""
-    cmd = [bin_path, "x", "-y", f"-o{dest_dir}", str(archive_path)]
+    cmd = [bin_path, "x", "-y", "-mmt=on", f"-o{dest_dir}", str(archive_path)]
     if password is not None and password != "":
         cmd.insert(2, f"-p{password}")
     else:
@@ -383,7 +383,7 @@ def _extract_with_unrar(
     if bin_path is None:
         log.warning("unrar binary not available, skipping")
         return None
-    cmd = [bin_path, "x", "-y", "-o+"]
+    cmd = [bin_path, "x", "-y", "-o+", "-mt4"]
     if password is not None and password != "":
         cmd.append(f"-p{password}")
     else:

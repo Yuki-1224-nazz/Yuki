@@ -486,6 +486,7 @@ async def _run_job(
                     on_status=_make_status_cb(idx),
                     on_progress=_make_progress_cb(idx),
                     num_connections=DOWNLOAD_CONNECTIONS,
+                    skip_zip=True,
                 )
             except Exception as exc:
                 log.exception("pipeline failed for %s", url)

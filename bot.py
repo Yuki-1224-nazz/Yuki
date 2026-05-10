@@ -856,19 +856,20 @@ async def _run_job(
 # Utility commands
 # ---------------------------------------------------------------------------
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show current job status for the requesting user."""
+    """Show current job status for all admins."""
     if not _is_admin(update):
         await _deny_access(update)
         return
-    user_id = update.effective_user.id
-    job_status = _active_jobs.get(user_id)
-    if job_status:
-        await update.message.reply_text(
-            f"\U0001f504 *Active job:* {job_status}",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-    else:
-        await update.message.reply_text("\u2705 No active job running.")
+    if not _active_jobs:
+        await update.message.reply_text("\u2705 No active jobs running.")
+        return
+    lines: list[str] = []
+    for uid, status_text in _active_jobs.items():
+        lines.append(f"\u2022 User `{uid}`: {status_text}")
+    await update.message.reply_text(
+        f"\U0001f504 *Active jobs ({len(_active_jobs)}):*\n" + "\n".join(lines),
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
 
 async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1016,6 +1017,9 @@ def build_app() -> Application:
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
         name="logs2cookie_conv",
         persistent=False,
+        per_user=True,
+        per_chat=True,
+        allow_reentry=True,
     )
 
     app.add_handler(conv)

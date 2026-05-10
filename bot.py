@@ -125,7 +125,7 @@ def _parse_admins(raw: str) -> set[int]:
     return out
 
 
-ADMIN_IDS: set[int] = _parse_admins(os.getenv("ADMIN_IDS", "5028065177", "5376199311"))
+ADMIN_IDS: set[int] = _parse_admins(os.getenv("ADMIN_IDS", "5028065177,5376199311"))
 
 
 def _is_admin(update: Update) -> bool:

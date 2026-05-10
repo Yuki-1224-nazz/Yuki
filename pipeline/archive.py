@@ -238,22 +238,23 @@ def _run_extractor(
     cmd: list[str],
     timeout: int,
 ) -> subprocess.CompletedProcess[str]:
-    """Run an extractor command, decoding output as UTF-8 with replacement.
+    """Run an extractor command, capturing only stderr (for error detection).
 
-    Archives frequently contain filenames with non-UTF-8 bytes (e.g.
-    Windows-1251 Cyrillic, Shift-JIS, etc.).  Using ``text=True`` would
-    crash with ``UnicodeDecodeError``, so we capture raw bytes and
-    decode manually with ``errors="replace"``.
+    Stdout is discarded (it's per-file progress which can be huge for
+    large archives).  Only the last 8 KB of stderr is kept for
+    password/error detection.
     """
     proc = subprocess.run(
-        cmd, capture_output=True, timeout=timeout, check=False,
-        stdin=subprocess.DEVNULL,
+        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        timeout=timeout, check=False, stdin=subprocess.DEVNULL,
     )
+    # Keep only tail of stderr (error messages are at the end)
+    stderr_raw = proc.stderr[-8192:] if proc.stderr else b""
     return subprocess.CompletedProcess(
         args=proc.args,
         returncode=proc.returncode,
-        stdout=proc.stdout.decode("utf-8", errors="replace") if proc.stdout else "",
-        stderr=proc.stderr.decode("utf-8", errors="replace") if proc.stderr else "",
+        stdout="",
+        stderr=stderr_raw.decode("utf-8", errors="replace"),
     )
 
 

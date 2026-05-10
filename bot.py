@@ -581,10 +581,14 @@ async def _run_job(
                 """Read one cookie file, return per-keyword content
                 as ready-to-zip strings (no intermediate files)."""
                 idx, src_path = item
+                sp = str(src_path)
                 try:
-                    fd = os.open(str(src_path), os.O_RDONLY)
+                    sz = os.path.getsize(sp)
+                    if sz == 0 or sz > 512 * 1024:
+                        return idx, src_path.name, {}
+                    fd = os.open(sp, os.O_RDONLY)
                     try:
-                        raw = os.read(fd, 2 * 1024 * 1024)
+                        raw = os.read(fd, 512 * 1024)
                     finally:
                         os.close(fd)
                 except OSError:
@@ -612,30 +616,34 @@ async def _run_job(
             loop = asyncio.get_running_loop()
             workers = min(32, max(4, len(all_cookie_files) // 50))
             classify_start = time.time()
+            n_files = len(all_cookie_files)
 
-            # Submit ALL at once for max parallelism
             items = [
                 (i + 1, all_cookie_files[i])
-                for i in range(len(all_cookie_files))
+                for i in range(n_files)
             ]
             all_classified: list[tuple[int, str, dict[str, str]]] = []
+            batch_sz = min(500, max(100, n_files // 20))
+            done = 0
+            last_edit = time.time()
             with ThreadPoolExecutor(max_workers=workers) as pool:
-                all_futs = [
-                    loop.run_in_executor(pool, _classify_one, it)
-                    for it in items
-                ]
-                batch_sz = max(500, len(all_futs) // 4)
-                done = 0
-                for bs in range(0, len(all_futs), batch_sz):
-                    batch = all_futs[bs : bs + batch_sz]
-                    results = await asyncio.gather(*batch)
+                for bs in range(0, len(items), batch_sz):
+                    batch = items[bs : bs + batch_sz]
+                    futs = [
+                        loop.run_in_executor(pool, _classify_one, it)
+                        for it in batch
+                    ]
+                    results = await asyncio.gather(*futs)
                     all_classified.extend(results)
                     done += len(batch)
-                    await _edit(
-                        f"🔄 Classifying... "
-                        f"{done:,}/{len(all_cookie_files):,} files "
-                        f"({time.time() - classify_start:.0f}s)"
-                    )
+                    now = time.time()
+                    if now - last_edit >= 2:
+                        last_edit = now
+                        await _edit(
+                            f"🔄 Classifying... "
+                            f"{done:,}/{n_files:,} files "
+                            f"({now - classify_start:.0f}s)"
+                        )
 
             # Build per-keyword zips DIRECTLY in memory (no disk I/O)
             sent_count = 0

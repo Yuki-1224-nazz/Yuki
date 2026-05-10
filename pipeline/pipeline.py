@@ -22,6 +22,7 @@ import asyncio
 import logging
 import os
 import re
+import shutil
 import time as _time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -111,6 +112,9 @@ def _fast_file_count(root: str) -> int:
     return count
 
 
+_MAX_COOKIE_FILE_BYTES = 512 * 1024  # 512 KB — real cookies are small
+
+
 def _scan_and_convert_one(
     args: tuple,
 ) -> Optional[tuple[Path, int, List[CookieRow]]]:
@@ -128,11 +132,19 @@ def _scan_and_convert_one(
     if not is_hint and not lname.endswith(".txt"):
         return None
 
+    # Quick reject: skip large files (real cookie files are small)
+    try:
+        size = os.path.getsize(file_path_str)
+        if size == 0 or size > _MAX_COOKIE_FILE_BYTES:
+            return None
+    except OSError:
+        return None
+
     # Read the file once — used for both detection AND conversion
     try:
         fd = os.open(file_path_str, os.O_RDONLY)
         try:
-            raw = os.read(fd, 2 * 1024 * 1024)  # 2 MB max
+            raw = os.read(fd, _MAX_COOKIE_FILE_BYTES)
         finally:
             os.close(fd)
     except OSError:
@@ -151,7 +163,6 @@ def _scan_and_convert_one(
             rows.append(row)
 
     if not rows:
-        # If no hint in name and no cookies found, it's not a cookie file
         return None
 
     # Build label from path
@@ -309,17 +320,20 @@ async def async_run_pipeline(
         )
 
         # Show live progress updates while extraction runs
+        _last_file_count = 0
         while not extraction_future.done():
-            await asyncio.sleep(5)
+            await asyncio.sleep(3)
             if extraction_future.done():
                 break
             elapsed = int(_time.time() - extract_start)
-            file_count = 0
             if extracted.exists():
-                file_count = _fast_file_count(str(extracted))
+                try:
+                    _last_file_count = _fast_file_count(str(extracted))
+                except OSError:
+                    pass
             status(
                 f"⚙ Extracting {kind} archive ({dl_size_mb:.0f} MB)...\n"
-                f"📂 {file_count:,} files extracted\n"
+                f"📂 {_last_file_count:,} files extracted\n"
                 f"⏱️ {elapsed}s elapsed"
             )
 
@@ -338,9 +352,8 @@ async def async_run_pipeline(
         all_files = await loop.run_in_executor(
             None, lambda: _fast_listdir(str(extracted))
         )
-        status(
-            f"🔄 Processing {len(all_files):,} files..."
-        )
+        total_files = len(all_files)
+        status(f"🔄 Processing {total_files:,} files...")
 
         # Precompute keyword lowercase list
         kw_lowers: List[str] = []
@@ -352,13 +365,15 @@ async def async_run_pipeline(
 
         cookies_dir_str = str(cookies_dir)
         extracted_str = str(extracted)
-        workers = min(32, max(4, len(all_files) // 100))
+        workers = min(32, max(4, total_files // 100))
 
         # Build args for each file
         work_items = [
             (i, fp, cookies_dir_str, extracted_str, kw_lowers)
             for i, fp in enumerate(all_files, start=1)
         ]
+        # Free the list early
+        del all_files
 
         if len(work_items) <= 50:
             for item in work_items:
@@ -368,36 +383,42 @@ async def async_run_pipeline(
                     result.cookie_files.append(path)
                     result.cookie_count += count
         else:
-            # Submit ALL at once with progress
+            # Process in small batches for responsive progress
             processed = 0
+            batch_size = min(500, max(100, total_files // 20))
+            last_status = _time.time()
             with ThreadPoolExecutor(max_workers=workers) as pool:
-                all_futures = [
-                    loop.run_in_executor(
-                        pool, _scan_and_convert_one, item,
-                    )
-                    for item in work_items
-                ]
-                batch_size = max(500, len(all_futures) // 4)
-                for batch_start in range(
-                    0, len(all_futures), batch_size
-                ):
-                    batch = all_futures[
-                        batch_start : batch_start + batch_size
+                for bs in range(0, len(work_items), batch_size):
+                    batch = work_items[bs : bs + batch_size]
+                    futs = [
+                        loop.run_in_executor(
+                            pool, _scan_and_convert_one, item,
+                        )
+                        for item in batch
                     ]
-                    batch_results = await asyncio.gather(*batch)
+                    batch_results = await asyncio.gather(*futs)
                     for r in batch_results:
                         if r is not None:
                             path, count, _rows = r
                             result.cookie_files.append(path)
                             result.cookie_count += count
                     processed += len(batch)
-                    elapsed_conv = _time.time() - convert_start
-                    status(
-                        f"🔄 Converting... "
-                        f"{processed:,}/{len(all_files):,} files "
-                        f"({result.cookie_count:,} cookies, "
-                        f"{elapsed_conv:.0f}s)"
-                    )
+                    now = _time.time()
+                    if now - last_status >= 2:
+                        last_status = now
+                        elapsed_conv = now - convert_start
+                        status(
+                            f"🔄 Converting... "
+                            f"{processed:,}/{total_files:,} files "
+                            f"({result.cookie_count:,} cookies, "
+                            f"{elapsed_conv:.0f}s)"
+                        )
+
+        # Clean up extracted files to free disk
+        try:
+            shutil.rmtree(extracted, ignore_errors=True)
+        except OSError:
+            pass
     else:
         status("⚙ Processing... (parsing as plain cookie file)")
         rows: List[CookieRow] = []

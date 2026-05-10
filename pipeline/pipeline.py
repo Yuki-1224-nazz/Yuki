@@ -75,35 +75,9 @@ def _safe_name(name: str) -> str:
     return cleaned or "cookies"
 
 
-def _is_cookie_file(p: Path) -> bool:
-    """Check if a single file is a cookie file (for parallel use)."""
-    lname = p.name.lower()
-    if any(h in lname for h in COOKIE_FILENAME_HINTS):
-        return True
-    if not lname.endswith(".txt"):
-        return False
-    # Read first 2 KB to detect cookie format (faster than 4 KB)
-    try:
-        fd = os.open(str(p), os.O_RDONLY)
-        try:
-            head = os.read(fd, 2048).decode("utf-8", errors="replace")
-        finally:
-            os.close(fd)
-    except OSError:
-        return False
-    for line in head.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            if stripped.startswith("#HttpOnly_") and stripped.count("\t") == 6:
-                return True
-            continue
-        return parse_cookie_line(line) is not None
-    return False
-
-
-def _fast_listdir(root: str) -> List[Path]:
-    """Recursively list files using os.scandir (3-5x faster than rglob)."""
-    result: List[Path] = []
+def _fast_listdir(root: str) -> List[str]:
+    """Recursively list file paths using os.scandir (much faster than rglob)."""
+    result: List[str] = []
     stack = [root]
     while stack:
         d = stack.pop()
@@ -111,7 +85,7 @@ def _fast_listdir(root: str) -> List[Path]:
             with os.scandir(d) as it:
                 for entry in it:
                     if entry.is_file(follow_symlinks=False):
-                        result.append(Path(entry.path))
+                        result.append(entry.path)
                     elif entry.is_dir(follow_symlinks=False):
                         stack.append(entry.path)
         except OSError:
@@ -137,41 +111,86 @@ def _fast_file_count(root: str) -> int:
     return count
 
 
-def _find_cookie_files(root: Path) -> List[Path]:
-    all_files = _fast_listdir(str(root))
-    if len(all_files) <= 100:
-        return [p for p in all_files if _is_cookie_file(p)]
-    # Parallel scan for large archives
-    workers = min(16, max(4, len(all_files) // 500))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        results = list(pool.map(_is_cookie_file, all_files))
-    return [p for p, is_cookie in zip(all_files, results) if is_cookie]
+def _scan_and_convert_one(
+    args: tuple,
+) -> Optional[tuple[Path, int, List[CookieRow]]]:
+    """Combined scan + convert in ONE pass.
 
+    Checks if a file is a cookie file and converts it in the same read.
+    Returns (out_path, count, rows) or None.
+    """
+    idx, file_path_str, cookies_dir_str, extracted_str, kw_lowers = args
+    name = os.path.basename(file_path_str)
+    lname = name.lower()
 
-def _extract_set(
-    src: Path,
-    out_path: Path,
-    keywords: Optional[Sequence[str]],
-) -> int:
-    """Read one source cookies file and write one Netscape file out."""
-    # Read entire file at once (faster than line-by-line for small files)
+    # Quick reject: not a .txt and no cookie hint in name
+    is_hint = any(h in lname for h in COOKIE_FILENAME_HINTS)
+    if not is_hint and not lname.endswith(".txt"):
+        return None
+
+    # Read the file once — used for both detection AND conversion
     try:
-        raw = src.read_bytes().decode("utf-8", errors="replace")
+        fd = os.open(file_path_str, os.O_RDONLY)
+        try:
+            raw = os.read(fd, 2 * 1024 * 1024)  # 2 MB max
+        finally:
+            os.close(fd)
     except OSError:
-        return 0
-    kw_list = [k for k in (keywords or []) if k and k.strip()]
+        return None
+
+    text = raw.decode("utf-8", errors="replace")
     rows: List[CookieRow] = []
-    for line in raw.splitlines():
-        if kw_list:
+
+    for line in text.splitlines():
+        if kw_lowers:
             low = line.lower()
-            if not any(k.strip().lower() in low for k in kw_list):
+            if not any(kw_lo in low for kw_lo in kw_lowers):
                 continue
         row = parse_cookie_line(line)
         if row is not None:
             rows.append(row)
+
     if not rows:
-        return 0
-    return write_netscape_file(out_path, rows)
+        # If no hint in name and no cookies found, it's not a cookie file
+        return None
+
+    # Build label from path
+    try:
+        rel = os.path.relpath(file_path_str, extracted_str)
+    except ValueError:
+        rel = name
+    parts = [
+        re.sub(r"[^A-Za-z0-9._-]+", "_", p).strip("._") or "cookies"
+        for p in rel.replace("\\", "/").split("/")
+        if p not in (".", "")
+    ]
+    label = "__".join(parts) if parts else "cookies"
+    if label.lower().endswith(".txt"):
+        label = label[:-4]
+    if len(label) > _MAX_LABEL_LEN:
+        label = label[:_MAX_LABEL_LEN]
+
+    out_name = f"{idx:04d}_{label}.txt"
+    out_path = os.path.join(cookies_dir_str, out_name)
+
+    # Write output using fast os.write
+    header = (
+        "# Netscape HTTP Cookie File\n"
+        "# https://curl.se/docs/http-cookies.html\n"
+        "# This is a generated file. Do not edit.\n\n"
+    )
+    parts_out = [header]
+    for r in rows:
+        parts_out.append(r.to_line())
+        parts_out.append("\n")
+    data = "".join(parts_out).encode("utf-8")
+    fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+
+    return Path(out_path), len(rows), rows
 
 
 def _zip_results(zip_path: Path, files: Sequence[Path], root: Path) -> None:
@@ -179,52 +198,13 @@ def _zip_results(zip_path: Path, files: Sequence[Path], root: Path) -> None:
     with zipfile.ZipFile(
         zip_path,
         "w",
-        compression=zipfile.ZIP_DEFLATED,
-        compresslevel=1,
+        compression=zipfile.ZIP_STORED,
     ) as z:
         for p in files:
             z.write(p, arcname=p.relative_to(root).as_posix())
 
 
 _MAX_LABEL_LEN = 80
-
-
-def _label_for(src: Path, archive_root: Path) -> str:
-    """Build a human-readable filename from the source path inside the archive."""
-    try:
-        rel = src.relative_to(archive_root)
-    except ValueError:
-        rel = Path(src.name)
-    parts = [_safe_name(p) for p in rel.parts if p not in (".", "")]
-    if not parts:
-        return _safe_name(src.stem)[:_MAX_LABEL_LEN]
-    label = "__".join(parts)
-    if label.lower().endswith(".txt"):
-        label = label[:-4]
-    label = label or _safe_name(src.stem)
-    if len(label) > _MAX_LABEL_LEN:
-        label = label[:_MAX_LABEL_LEN]
-    return label
-
-
-def _process_cookie_source(
-    i: int,
-    src: Path,
-    cookies_dir: Path,
-    extracted: Path,
-    keywords: Optional[Sequence[str]],
-) -> tuple[Optional[Path], int]:
-    """Process a single cookie source file. Returns (path, count) or (None, 0)."""
-    label = _label_for(src, extracted)
-    out_path = cookies_dir / f"{i:04d}_{label}.txt"
-    n = _extract_set(src, out_path, keywords)
-    if n:
-        return out_path, n
-    try:
-        out_path.unlink()
-    except OSError:
-        pass
-    return None, 0
 
 
 async def async_run_pipeline(
@@ -352,63 +332,72 @@ async def async_run_pipeline(
         except OSError:
             pass
 
-        scan_start = _time.time()
-        status("⚙ Scanning files...")
-        sources = await loop.run_in_executor(None, lambda: _find_cookie_files(extracted))
-        scan_secs = _time.time() - scan_start
+        # Combined scan + convert in ONE pass (no separate scan step)
+        convert_start = _time.time()
+        status("🔄 Scanning & converting...")
+        all_files = await loop.run_in_executor(
+            None, lambda: _fast_listdir(str(extracted))
+        )
+        status(
+            f"🔄 Processing {len(all_files):,} files..."
+        )
 
-        if not sources:
-            status("⚙ Processing... (no cookie files found)")
+        # Precompute keyword lowercase list
+        kw_lowers: List[str] = []
+        if keywords:
+            kw_lowers = [
+                k.strip().lower() for k in keywords
+                if k and k.strip()
+            ]
+
+        cookies_dir_str = str(cookies_dir)
+        extracted_str = str(extracted)
+        workers = min(32, max(4, len(all_files) // 100))
+
+        # Build args for each file
+        work_items = [
+            (i, fp, cookies_dir_str, extracted_str, kw_lowers)
+            for i, fp in enumerate(all_files, start=1)
+        ]
+
+        if len(work_items) <= 50:
+            for item in work_items:
+                r = _scan_and_convert_one(item)
+                if r is not None:
+                    path, count, _rows = r
+                    result.cookie_files.append(path)
+                    result.cookie_count += count
         else:
-            status(
-                f"🔄 Converting {len(sources):,} cookie files "
-                f"(scan took {scan_secs:.1f}s)..."
-            )
-
-            workers = min(32, max(4, len(sources) // 50))
-            convert_start = _time.time()
-
-            if len(sources) <= 20:
-                for i, src in enumerate(sources, start=1):
-                    path, count = _process_cookie_source(
-                        i, src, cookies_dir, extracted, keywords
+            # Submit ALL at once with progress
+            processed = 0
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                all_futures = [
+                    loop.run_in_executor(
+                        pool, _scan_and_convert_one, item,
                     )
-                    if path is not None:
-                        result.cookie_files.append(path)
-                        result.cookie_count += count
-            else:
-                # Submit ALL futures at once for maximum parallelism
-                processed = 0
-                with ThreadPoolExecutor(max_workers=workers) as pool:
-                    all_futures = [
-                        loop.run_in_executor(
-                            pool,
-                            _process_cookie_source,
-                            i, src, cookies_dir, extracted, keywords,
-                        )
-                        for i, src in enumerate(sources, start=1)
+                    for item in work_items
+                ]
+                batch_size = max(500, len(all_futures) // 4)
+                for batch_start in range(
+                    0, len(all_futures), batch_size
+                ):
+                    batch = all_futures[
+                        batch_start : batch_start + batch_size
                     ]
-                    # Gather results as they complete with progress
-                    batch_size = max(200, len(sources) // 5)
-                    for batch_start in range(
-                        0, len(all_futures), batch_size
-                    ):
-                        batch = all_futures[
-                            batch_start : batch_start + batch_size
-                        ]
-                        batch_results = await asyncio.gather(*batch)
-                        for path, count in batch_results:
-                            if path is not None:
-                                result.cookie_files.append(path)
-                                result.cookie_count += count
-                        processed += len(batch)
-                        elapsed_conv = _time.time() - convert_start
-                        status(
-                            f"🔄 Converting... "
-                            f"{processed:,}/{len(sources):,} files "
-                            f"({result.cookie_count:,} cookies found, "
-                            f"{elapsed_conv:.0f}s)"
-                        )
+                    batch_results = await asyncio.gather(*batch)
+                    for r in batch_results:
+                        if r is not None:
+                            path, count, _rows = r
+                            result.cookie_files.append(path)
+                            result.cookie_count += count
+                    processed += len(batch)
+                    elapsed_conv = _time.time() - convert_start
+                    status(
+                        f"🔄 Converting... "
+                        f"{processed:,}/{len(all_files):,} files "
+                        f"({result.cookie_count:,} cookies, "
+                        f"{elapsed_conv:.0f}s)"
+                    )
     else:
         status("⚙ Processing... (parsing as plain cookie file)")
         rows: List[CookieRow] = []
@@ -490,20 +479,27 @@ def run_pipeline(
         extracted = workdir / "extracted"
         extract_archive(download_path, extracted, password=password)
 
-        status("⚙ Processing... (scanning extracted files)")
-        sources = _find_cookie_files(extracted)
-        if not sources:
-            status("⚙ Processing... (no cookie files found)")
-        else:
-            status(f"🔄 Converting... ({len(sources)} cookie set(s))")
-
-        for i, src in enumerate(sources, start=1):
-            path, count = _process_cookie_source(
-                i, src, cookies_dir, extracted, keywords
+        status("⚙ Processing... (scanning & converting)")
+        all_files = _fast_listdir(str(extracted))
+        kw_lowers: List[str] = []
+        if keywords:
+            kw_lowers = [
+                k.strip().lower() for k in keywords if k and k.strip()
+            ]
+        cookies_dir_str = str(cookies_dir)
+        extracted_str = str(extracted)
+        for i, fp in enumerate(all_files, start=1):
+            r = _scan_and_convert_one(
+                (i, fp, cookies_dir_str, extracted_str, kw_lowers)
             )
-            if path is not None:
+            if r is not None:
+                path, count, _rows = r
                 result.cookie_files.append(path)
                 result.cookie_count += count
+        if not result.cookie_files:
+            status("⚙ Processing... (no cookie files found)")
+        else:
+            status(f"🔄 Converting... ({len(result.cookie_files)} cookie set(s))")
     else:
         status("⚙ Processing... (parsing as plain cookie file)")
         rows: List[CookieRow] = []

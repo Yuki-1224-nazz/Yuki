@@ -28,6 +28,7 @@ Performance improvements in v2.1:
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import os
 import platform
@@ -55,7 +56,7 @@ from telegram.ext import (
 
 from pipeline import async_run_pipeline
 from pipeline.archive import SEVENZIP_BINARIES, _ensure_unrar
-from pipeline.cookies import parse_cookie_line, write_netscape_file
+from pipeline.cookies import parse_cookie_line
 
 load_dotenv()
 
@@ -559,9 +560,15 @@ async def _run_job(
         if len(keywords) > 1:
             from concurrent.futures import ThreadPoolExecutor
 
-            _active_jobs[user_id] = "Splitting results per keyword..."
+            _COOKIE_HEADER = (
+                "# Netscape HTTP Cookie File\n"
+                "# https://curl.se/docs/http-cookies.html\n"
+                "# This is a generated file. Do not edit.\n\n"
+            )
+
+            _active_jobs[user_id] = "Splitting by keywords..."
             await _edit(
-                f"🔄 Splitting {len(all_cookie_files):,} files "
+                f"🔄 Classifying {len(all_cookie_files):,} files "
                 f"by {len(keywords)} keywords..."
             )
 
@@ -570,17 +577,21 @@ async def _run_job(
 
             def _classify_one(
                 item: tuple[int, Path],
-            ) -> tuple[int, str, dict[str, list]]:
-                """Read one cookie file, bucket rows by keyword."""
+            ) -> tuple[int, str, dict[str, str]]:
+                """Read one cookie file, return per-keyword content
+                as ready-to-zip strings (no intermediate files)."""
                 idx, src_path = item
                 try:
-                    raw = src_path.read_bytes().decode(
-                        "utf-8", errors="replace"
-                    )
+                    fd = os.open(str(src_path), os.O_RDONLY)
+                    try:
+                        raw = os.read(fd, 2 * 1024 * 1024)
+                    finally:
+                        os.close(fd)
                 except OSError:
                     return idx, src_path.name, {}
+                text = raw.decode("utf-8", errors="replace")
                 per_kw: dict[str, list] = {}
-                for line in raw.splitlines():
+                for line in text.splitlines():
                     row = parse_cookie_line(line)
                     if row is None:
                         continue
@@ -588,126 +599,121 @@ async def _run_job(
                     for kw, kw_lo in kw_lower:
                         if kw_lo in low:
                             per_kw.setdefault(kw, []).append(row)
-                return idx, src_path.name, per_kw
+                # Convert rows to content strings immediately
+                per_kw_content: dict[str, str] = {}
+                for kw, rows in per_kw.items():
+                    lines = [_COOKIE_HEADER]
+                    for r in rows:
+                        lines.append(r.to_line())
+                        lines.append("\n")
+                    per_kw_content[kw] = "".join(lines)
+                return idx, src_path.name, per_kw_content
 
             loop = asyncio.get_running_loop()
             workers = min(32, max(4, len(all_cookie_files) // 50))
             classify_start = time.time()
-            all_classified: list[tuple[int, str, dict[str, list]]] = []
 
-            # Process in batches with progress
-            batch_sz = max(100, len(all_cookie_files) // 8)
-            processed = 0
+            # Submit ALL at once for max parallelism
             items = [
                 (i + 1, all_cookie_files[i])
                 for i in range(len(all_cookie_files))
             ]
+            all_classified: list[tuple[int, str, dict[str, str]]] = []
             with ThreadPoolExecutor(max_workers=workers) as pool:
-                for bs in range(0, len(items), batch_sz):
-                    batch = items[bs : bs + batch_sz]
-                    futs = [
-                        loop.run_in_executor(pool, _classify_one, it)
-                        for it in batch
-                    ]
-                    results = await asyncio.gather(*futs)
+                all_futs = [
+                    loop.run_in_executor(pool, _classify_one, it)
+                    for it in items
+                ]
+                batch_sz = max(500, len(all_futs) // 4)
+                done = 0
+                for bs in range(0, len(all_futs), batch_sz):
+                    batch = all_futs[bs : bs + batch_sz]
+                    results = await asyncio.gather(*batch)
                     all_classified.extend(results)
-                    processed += len(batch)
-                    elapsed_cls = time.time() - classify_start
+                    done += len(batch)
                     await _edit(
                         f"🔄 Classifying... "
-                        f"{processed:,}/{len(all_cookie_files):,} files "
-                        f"({elapsed_cls:.0f}s)"
+                        f"{done:,}/{len(all_cookie_files):,} files "
+                        f"({time.time() - classify_start:.0f}s)"
                     )
 
-            # Write per-keyword files and send zips
+            # Build per-keyword zips DIRECTLY in memory (no disk I/O)
             sent_count = 0
             grand_cookie_count = 0
             for kw_idx, kw in enumerate(keywords, start=1):
-                kw_dir = output_dir / f"kw_{kw}"
-                kw_cookies_dir = kw_dir / "cookies"
-                kw_cookies_dir.mkdir(parents=True, exist_ok=True)
-                kw_cookie_files: list[Path] = []
+                # Collect matching entries for this keyword
+                kw_entries: list[tuple[str, str]] = []  # (arcname, content)
                 kw_count = 0
-                for idx, name, per_kw in all_classified:
-                    rows = per_kw.get(kw)
-                    if not rows:
+                for idx, name, per_kw_content in all_classified:
+                    content = per_kw_content.get(kw)
+                    if not content:
                         continue
-                    out_path = kw_cookies_dir / f"{idx:04d}_{name}"
-                    write_netscape_file(out_path, rows)
-                    kw_cookie_files.append(out_path)
-                    kw_count += len(rows)
-                if not kw_cookie_files:
-                    await _edit(
-                        f"⚠️ No cookies found for keyword '{kw}' "
-                        f"({kw_idx}/{len(keywords)})"
-                    )
+                    arcname = f"cookies/{idx:04d}_{name}"
+                    kw_entries.append((arcname, content))
+                    kw_count += content.count("\t") // 6  # fast row count
+                if not kw_entries:
                     continue
                 grand_cookie_count += kw_count
                 await _edit(
                     f"📤 Sending {kw}_Cookies.zip "
                     f"({kw_idx}/{len(keywords)}) — "
-                    f"{len(kw_cookie_files)} sets, {kw_count:,} cookies..."
+                    f"{len(kw_entries)} sets, {kw_count:,} cookies..."
                 )
-                kw_zip = kw_dir / f"{kw}_Cookies.zip"
+
+                # Build zip in memory — no disk writes
+                zip_buf = io.BytesIO()
                 with zipfile.ZipFile(
-                    kw_zip, "w",
-                    compression=zipfile.ZIP_DEFLATED,
-                    compresslevel=1,
+                    zip_buf, "w", compression=zipfile.ZIP_STORED,
                 ) as z:
-                    for p in kw_cookie_files:
-                        z.write(p, arcname=p.relative_to(kw_dir).as_posix())
-                kw_zip_size = kw_zip.stat().st_size
-                if kw_zip_size <= DOC_UPLOAD_LIMIT:
-                    with open(kw_zip, "rb") as f:
-                        await context.bot.send_document(
-                            chat_id=chat_id,
-                            document=f,
-                            filename=kw_zip.name,
-                            caption=(
-                                f"🔑 {kw} — {len(kw_cookie_files)} set(s), "
-                                f"{kw_count:,} cookies"
-                            ),
-                        )
+                    for arcname, content in kw_entries:
+                        z.writestr(arcname, content)
+                zip_size = zip_buf.tell()
+
+                if zip_size <= DOC_UPLOAD_LIMIT:
+                    zip_buf.seek(0)
+                    await context.bot.send_document(
+                        chat_id=chat_id,
+                        document=zip_buf,
+                        filename=f"{kw}_Cookies.zip",
+                        caption=(
+                            f"🔑 {kw} — {len(kw_entries)} set(s), "
+                            f"{kw_count:,} cookies"
+                        ),
+                    )
                     sent_count += 1
                 else:
-                    # Split per-keyword zip into parts
+                    # Split into parts in memory
                     tgt = int(DOC_UPLOAD_LIMIT * 0.8)
-                    fpp = max(
+                    entries_per_part = max(
                         1,
-                        int(len(kw_cookie_files) * tgt / kw_zip_size),
+                        int(len(kw_entries) * tgt / zip_size),
                     )
-                    for ps in range(0, len(kw_cookie_files), fpp):
-                        pf = kw_cookie_files[ps : ps + fpp]
-                        pi = ps // fpp
+                    for ps in range(0, len(kw_entries), entries_per_part):
+                        part = kw_entries[ps : ps + entries_per_part]
+                        pi = ps // entries_per_part
                         pn = (
                             f"{kw}_Cookies.zip" if pi == 0
                             else f"{kw}_Cookies_{pi}.zip"
                         )
-                        pp = kw_dir / pn
+                        pbuf = io.BytesIO()
                         with zipfile.ZipFile(
-                            pp, "w",
-                            compression=zipfile.ZIP_DEFLATED,
-                            compresslevel=1,
+                            pbuf, "w",
+                            compression=zipfile.ZIP_STORED,
                         ) as z:
-                            for p in pf:
-                                z.write(
-                                    p,
-                                    arcname=p.relative_to(
-                                        kw_dir
-                                    ).as_posix(),
-                                )
-                        if pp.stat().st_size > DOC_UPLOAD_LIMIT:
+                            for arcname, content in part:
+                                z.writestr(arcname, content)
+                        if pbuf.tell() > DOC_UPLOAD_LIMIT:
                             continue
-                        with open(pp, "rb") as f:
-                            await context.bot.send_document(
-                                chat_id=chat_id,
-                                document=f,
-                                filename=pn,
-                                caption=(
-                                    f"🔑 {kw} part {pi + 1} — "
-                                    f"{len(pf)} set(s)"
-                                ),
-                            )
+                        pbuf.seek(0)
+                        await context.bot.send_document(
+                            chat_id=chat_id,
+                            document=pbuf,
+                            filename=pn,
+                            caption=(
+                                f"🔑 {kw} part {pi + 1} — "
+                                f"{len(part)} set(s)"
+                            ),
+                        )
                         sent_count += 1
             elapsed = int(time.time() - started)
             await _edit(
@@ -726,7 +732,7 @@ async def _run_job(
             # Build one zip first; if too large, split into parts
             zip_path = output_dir / "cookies_result.zip"
             with zipfile.ZipFile(
-                zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1,
+                zip_path, "w", compression=zipfile.ZIP_STORED,
             ) as z:
                 for p in all_cookie_files:
                     z.write(p, arcname=p.relative_to(output_dir).as_posix())
@@ -787,7 +793,7 @@ async def _run_job(
                     part_path = output_dir / part_name
                     with zipfile.ZipFile(
                         part_path, "w",
-                        compression=zipfile.ZIP_DEFLATED, compresslevel=1,
+                        compression=zipfile.ZIP_STORED,
                     ) as z:
                         for p in part_files:
                             z.write(

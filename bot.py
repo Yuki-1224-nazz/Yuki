@@ -614,7 +614,7 @@ async def _run_job(
                 return idx, src_path.name, per_kw_content
 
             loop = asyncio.get_running_loop()
-            workers = min(32, max(4, len(all_cookie_files) // 50))
+            workers = min(50, max(8, len(all_cookie_files) // 30))
             classify_start = time.time()
             n_files = len(all_cookie_files)
 
@@ -623,7 +623,7 @@ async def _run_job(
                 for i in range(n_files)
             ]
             all_classified: list[tuple[int, str, dict[str, str]]] = []
-            batch_sz = min(500, max(100, n_files // 20))
+            batch_sz = min(1000, max(200, n_files // 10))
             done = 0
             last_edit = time.time()
             with ThreadPoolExecutor(max_workers=workers) as pool:

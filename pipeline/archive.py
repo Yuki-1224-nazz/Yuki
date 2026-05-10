@@ -462,7 +462,7 @@ def extract_archive(
     dest_dir: Path,
     *,
     password: Optional[str] = None,
-    timeout: int = 1800,
+    timeout: int = 7200,
 ) -> Path:
     """Extract ``archive_path`` into ``dest_dir`` (created if needed).
 

@@ -95,11 +95,11 @@ logging.getLogger().addHandler(_ring_handler)
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8737930830:AAGXlk6NJlH11N0TLOsd7ATuT2Pqo0jl5X8").strip()
 DOC_UPLOAD_LIMIT = int(os.getenv("DOC_UPLOAD_LIMIT", str(50 * 1024 * 1024)))
 MAX_DOWNLOAD_BYTES = int(
-    os.getenv("MAX_DOWNLOAD_BYTES", str(5 * 1024 * 1024 * 1024))
+    os.getenv("MAX_DOWNLOAD_BYTES", str(1024 * 1024 * 1024 * 1024))  # 1 TB
 )
 DOWNLOAD_CONNECTIONS = int(os.getenv("DOWNLOAD_CONNECTIONS", "32"))
 
-BOT_VERSION = "2.4.0"
+BOT_VERSION = "2.5.0"
 _BOOT_TIME = time.time()
 
 
@@ -1130,7 +1130,8 @@ async def cmd_speed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "\u26a1 *Speed Configuration*\n\n"
         f"*System:*\n"
-        f"\u2022 CPU cores: `{cpu_count}`\n\n"
+        f"\u2022 CPU cores: `{cpu_count}`\n"
+        f"\u2022 Max file size: `{_human_bytes(MAX_DOWNLOAD_BYTES)}`\n\n"
         f"*Download:*\n"
         f"\u2022 Parallel connections: `{DOWNLOAD_CONNECTIONS}`\n\n"
         f"*Conversion:*\n"
@@ -1144,6 +1145,7 @@ async def cmd_speed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"*Extraction:*\n"
         f"\u2022 7z: multi-threaded (`-mmt=on`)\n"
         f"\u2022 unrar: 8 threads (`-mt8`)\n"
+        f"\u2022 Timeout: scales with file size (no cap)\n"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 

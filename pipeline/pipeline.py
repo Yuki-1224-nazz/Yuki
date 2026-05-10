@@ -307,8 +307,8 @@ async def async_run_pipeline(
         )
         extracted = workdir / "extracted"
 
-        # Scale timeout with archive size (min 600s, +60s per 100 MB)
-        extraction_timeout = max(600, int(600 + (dl_size_mb / 100) * 60))
+        # Scale timeout with archive size (min 600s, +120s per GB, no cap)
+        extraction_timeout = max(600, int(600 + (dl_size_mb / 1024) * 120))
 
         loop = asyncio.get_running_loop()
         extract_start = _time.time()

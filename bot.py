@@ -30,8 +30,10 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import glob
 import os
 import platform
+import psutil  # type: ignore[import-untyped]
 import shutil
 import tempfile
 import time
@@ -66,6 +68,30 @@ logging.basicConfig(
 )
 log = logging.getLogger("logs-to-cookie.bot")
 
+
+# ---------------------------------------------------------------------------
+# In-memory ring buffer for recent WARNING+ log messages
+# ---------------------------------------------------------------------------
+class _RingHandler(logging.Handler):
+    """Keep the last *maxlen* WARNING+ records in memory."""
+
+    def __init__(self, maxlen: int = 30) -> None:
+        super().__init__(level=logging.WARNING)
+        self.records: deque[str] = deque(maxlen=maxlen)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.records.append(self.format(record))
+        except Exception:
+            pass
+
+
+_ring_handler = _RingHandler(maxlen=30)
+_ring_handler.setFormatter(
+    logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
+)
+logging.getLogger().addHandler(_ring_handler)
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8737930830:AAGXlk6NJlH11N0TLOsd7ATuT2Pqo0jl5X8").strip()
 DOC_UPLOAD_LIMIT = int(os.getenv("DOC_UPLOAD_LIMIT", str(50 * 1024 * 1024)))
 MAX_DOWNLOAD_BYTES = int(
@@ -73,7 +99,7 @@ MAX_DOWNLOAD_BYTES = int(
 )
 DOWNLOAD_CONNECTIONS = int(os.getenv("DOWNLOAD_CONNECTIONS", "32"))
 
-BOT_VERSION = "2.3.0"
+BOT_VERSION = "2.4.0"
 _BOOT_TIME = time.time()
 
 
@@ -252,15 +278,26 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     text = (
         "📋 *Available Commands*\n\n"
+        "*Core:*\n"
         "🔹 /start — Start cookie extraction flow\n"
         "🔹 /help — Show this command list\n"
         "🔹 /skip — Skip password or keywords prompt\n"
-        "🔹 /cancel — Cancel current job\n"
-        "🔹 /status — Check if a job is running\n"
+        "🔹 /cancel — Cancel current job\n\n"
+        "*Monitoring:*\n"
+        "🔹 /status — Check active jobs (all admins)\n"
+        "🔹 /ping — Health check with latency\n"
+        "🔹 /memory — Show RAM usage\n"
+        "🔹 /disk — Show disk usage\n"
+        "🔹 /logs — Recent warnings & errors\n\n"
+        "*Configuration:*\n"
         "🔹 /settings — View bot configuration\n"
-        "🔹 /history — Last 10 completed jobs\n"
         "🔹 /connections — View/set parallel downloads (1–64)\n"
+        "🔹 /speed — Worker/thread config\n"
+        "🔹 /admins — Show admin list\n\n"
+        "*Utilities:*\n"
+        "🔹 /history — Last 10 completed jobs\n"
         "🔹 /info — Bot version, uptime, stats\n"
+        "🔹 /cleanup — Clear temp files to free disk\n"
         "\n"
         "💡 *Tips:*\n"
         "• Send multiple links (comma/space separated)\n"
@@ -981,6 +1018,155 @@ async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Quick health check with latency measurement."""
+    if not _is_admin(update):
+        await _deny_access(update)
+        return
+    t0 = time.time()
+    msg = await update.message.reply_text("\U0001f3d3 Pong!")
+    latency_ms = int((time.time() - t0) * 1000)
+    await msg.edit_text(f"\U0001f3d3 Pong!  Latency: `{latency_ms}ms`", parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_disk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show disk usage — useful for Railway's limited storage."""
+    if not _is_admin(update):
+        await _deny_access(update)
+        return
+    usage = shutil.disk_usage("/")
+    tmp_size = 0
+    for entry in glob.iglob("/tmp/logs2cookie-*"):
+        try:
+            if os.path.isdir(entry):
+                for root, _dirs, files in os.walk(entry):
+                    for f in files:
+                        try:
+                            tmp_size += os.path.getsize(os.path.join(root, f))
+                        except OSError:
+                            pass
+        except OSError:
+            pass
+    text = (
+        "\U0001f4be *Disk Usage*\n\n"
+        f"\u2022 Total: `{_human_bytes(usage.total)}`\n"
+        f"\u2022 Used: `{_human_bytes(usage.used)}` ({usage.used * 100 // usage.total}%)\n"
+        f"\u2022 Free: `{_human_bytes(usage.free)}`\n"
+        f"\u2022 Bot temp files: `{_human_bytes(tmp_size)}`\n"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show RAM usage — monitor for OOM on Railway."""
+    if not _is_admin(update):
+        await _deny_access(update)
+        return
+    vm = psutil.virtual_memory()
+    proc = psutil.Process(os.getpid())
+    proc_mem = proc.memory_info()
+    text = (
+        "\U0001f9e0 *Memory Usage*\n\n"
+        f"*System:*\n"
+        f"\u2022 Total: `{_human_bytes(vm.total)}`\n"
+        f"\u2022 Used: `{_human_bytes(vm.used)}` ({vm.percent}%)\n"
+        f"\u2022 Available: `{_human_bytes(vm.available)}`\n\n"
+        f"*Bot process:*\n"
+        f"\u2022 RSS: `{_human_bytes(proc_mem.rss)}`\n"
+        f"\u2022 VMS: `{_human_bytes(proc_mem.vms)}`\n"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Clean temp files to free disk space."""
+    if not _is_admin(update):
+        await _deny_access(update)
+        return
+    removed = 0
+    freed = 0
+    for entry in glob.iglob("/tmp/logs2cookie-*"):
+        try:
+            if os.path.isdir(entry):
+                size = 0
+                for root, _dirs, files in os.walk(entry):
+                    for f in files:
+                        try:
+                            size += os.path.getsize(os.path.join(root, f))
+                        except OSError:
+                            pass
+                shutil.rmtree(entry, ignore_errors=True)
+                removed += 1
+                freed += size
+        except OSError:
+            pass
+    text = (
+        "\U0001f9f9 *Cleanup Complete*\n\n"
+        f"\u2022 Directories removed: `{removed}`\n"
+        f"\u2022 Space freed: `{_human_bytes(freed)}`\n"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_admins(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show current admin list."""
+    if not _is_admin(update):
+        await _deny_access(update)
+        return
+    if ADMIN_IDS:
+        admin_lines = "\n".join(f"\u2022 `{uid}`" for uid in sorted(ADMIN_IDS))
+        text = f"\U0001f464 *Admins ({len(ADMIN_IDS)}):*\n\n{admin_lines}"
+    else:
+        text = "\U0001f464 *Admins:* Everyone (no restriction)"
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_speed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show worker/thread configuration."""
+    if not _is_admin(update):
+        await _deny_access(update)
+        return
+    cpu_count = os.cpu_count() or 1
+    text = (
+        "\u26a1 *Speed Configuration*\n\n"
+        f"*System:*\n"
+        f"\u2022 CPU cores: `{cpu_count}`\n\n"
+        f"*Download:*\n"
+        f"\u2022 Parallel connections: `{DOWNLOAD_CONNECTIONS}`\n\n"
+        f"*Conversion:*\n"
+        f"\u2022 Max workers: `50`\n"
+        f"\u2022 Scales: 1 worker per 50 files (min 8)\n"
+        f"\u2022 Batch size: 200\u20131000 files\n\n"
+        f"*Classification:*\n"
+        f"\u2022 Max workers: `50`\n"
+        f"\u2022 Scales: 1 worker per 30 files (min 8)\n"
+        f"\u2022 Batch size: 200\u20131000 files\n\n"
+        f"*Extraction:*\n"
+        f"\u2022 7z: multi-threaded (`-mmt=on`)\n"
+        f"\u2022 unrar: 8 threads (`-mt8`)\n"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_logs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show recent warnings/errors from the bot log."""
+    if not _is_admin(update):
+        await _deny_access(update)
+        return
+    records = list(_ring_handler.records)
+    if not records:
+        await update.message.reply_text("\u2705 No warnings or errors logged.")
+        return
+    # Show last 15 entries max to avoid hitting Telegram message limits
+    entries = records[-15:]
+    lines = "\n".join(f"`{r}`" for r in entries)
+    text = f"\U0001f4dc *Recent Warnings/Errors ({len(records)} total):*\n\n{lines}"
+    # Truncate if too long for Telegram (4096 char limit)
+    if len(text) > 4000:
+        text = text[:4000] + "\n\n_(truncated)_"
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
 # ---------------------------------------------------------------------------
 # Wiring
 # ---------------------------------------------------------------------------
@@ -1029,6 +1215,13 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(CommandHandler("connections", cmd_connections))
     app.add_handler(CommandHandler("info", cmd_info))
+    app.add_handler(CommandHandler("ping", cmd_ping))
+    app.add_handler(CommandHandler("disk", cmd_disk))
+    app.add_handler(CommandHandler("memory", cmd_memory))
+    app.add_handler(CommandHandler("cleanup", cmd_cleanup))
+    app.add_handler(CommandHandler("admins", cmd_admins))
+    app.add_handler(CommandHandler("speed", cmd_speed))
+    app.add_handler(CommandHandler("logs", cmd_logs))
     return app
 
 
@@ -1069,11 +1262,18 @@ async def _post_init(application: Application) -> None:
     await application.bot.set_my_commands([
         BotCommand("start", "Start the bot"),
         BotCommand("help", "Show all commands"),
-        BotCommand("status", "Check current job status"),
+        BotCommand("status", "Check active jobs"),
         BotCommand("settings", "View bot configuration"),
         BotCommand("history", "Recent job history"),
         BotCommand("connections", "View/set download connections"),
         BotCommand("info", "Bot version & uptime"),
+        BotCommand("ping", "Health check with latency"),
+        BotCommand("disk", "Show disk usage"),
+        BotCommand("memory", "Show RAM usage"),
+        BotCommand("cleanup", "Clear temp files"),
+        BotCommand("admins", "Show admin list"),
+        BotCommand("speed", "Worker/thread configuration"),
+        BotCommand("logs", "Recent warnings & errors"),
         BotCommand("cancel", "Cancel current job"),
     ])
     log.info("Bot menu commands registered.")

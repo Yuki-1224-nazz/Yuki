@@ -55,7 +55,7 @@ from telegram.ext import (
 
 from pipeline import async_run_pipeline
 from pipeline.archive import SEVENZIP_BINARIES, _ensure_unrar
-from pipeline.cookies import iter_cookies_from_lines, write_netscape_file
+from pipeline.cookies import parse_cookie_line, write_netscape_file
 
 load_dotenv()
 
@@ -556,29 +556,102 @@ async def _run_job(
 
         # --- Per-keyword zip splitting (multiple keywords) ---
         if len(keywords) > 1:
+            from concurrent.futures import ThreadPoolExecutor
+
             _active_jobs[user_id] = "Splitting results per keyword..."
+            await _edit(
+                f"🔄 Splitting {len(all_cookie_files):,} files "
+                f"by {len(keywords)} keywords..."
+            )
+
+            # Precompute lowercase keywords once
+            kw_lower = [(kw, kw.strip().lower()) for kw in keywords]
+
+            def _classify_one(
+                item: tuple[int, Path],
+            ) -> tuple[int, str, dict[str, list]]:
+                """Read one cookie file, bucket rows by keyword."""
+                idx, src_path = item
+                try:
+                    raw = src_path.read_bytes().decode(
+                        "utf-8", errors="replace"
+                    )
+                except OSError:
+                    return idx, src_path.name, {}
+                per_kw: dict[str, list] = {}
+                for line in raw.splitlines():
+                    row = parse_cookie_line(line)
+                    if row is None:
+                        continue
+                    low = line.lower()
+                    for kw, kw_lo in kw_lower:
+                        if kw_lo in low:
+                            per_kw.setdefault(kw, []).append(row)
+                return idx, src_path.name, per_kw
+
+            loop = asyncio.get_running_loop()
+            workers = min(32, max(4, len(all_cookie_files) // 50))
+            classify_start = time.time()
+            all_classified: list[tuple[int, str, dict[str, list]]] = []
+
+            # Process in batches with progress
+            batch_sz = max(100, len(all_cookie_files) // 8)
+            processed = 0
+            items = [
+                (i + 1, all_cookie_files[i])
+                for i in range(len(all_cookie_files))
+            ]
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                for bs in range(0, len(items), batch_sz):
+                    batch = items[bs : bs + batch_sz]
+                    futs = [
+                        loop.run_in_executor(pool, _classify_one, it)
+                        for it in batch
+                    ]
+                    results = await asyncio.gather(*futs)
+                    all_classified.extend(results)
+                    processed += len(batch)
+                    elapsed_cls = time.time() - classify_start
+                    await _edit(
+                        f"🔄 Classifying... "
+                        f"{processed:,}/{len(all_cookie_files):,} files "
+                        f"({elapsed_cls:.0f}s)"
+                    )
+
+            # Write per-keyword files and send zips
             sent_count = 0
             grand_cookie_count = 0
-            for kw in keywords:
+            for kw_idx, kw in enumerate(keywords, start=1):
                 kw_dir = output_dir / f"kw_{kw}"
                 kw_cookies_dir = kw_dir / "cookies"
                 kw_cookies_dir.mkdir(parents=True, exist_ok=True)
                 kw_cookie_files: list[Path] = []
                 kw_count = 0
-                for i, src in enumerate(all_cookie_files, start=1):
-                    with open(src, "r", encoding="utf-8", errors="replace") as f:
-                        rows = list(iter_cookies_from_lines(f, keywords=[kw]))
-                    if rows:
-                        out_path = kw_cookies_dir / f"{i:04d}_{src.name}"
-                        write_netscape_file(out_path, rows)
-                        kw_cookie_files.append(out_path)
-                        kw_count += len(rows)
+                for idx, name, per_kw in all_classified:
+                    rows = per_kw.get(kw)
+                    if not rows:
+                        continue
+                    out_path = kw_cookies_dir / f"{idx:04d}_{name}"
+                    write_netscape_file(out_path, rows)
+                    kw_cookie_files.append(out_path)
+                    kw_count += len(rows)
                 if not kw_cookie_files:
+                    await _edit(
+                        f"⚠️ No cookies found for keyword '{kw}' "
+                        f"({kw_idx}/{len(keywords)})"
+                    )
                     continue
                 grand_cookie_count += kw_count
+                await _edit(
+                    f"📤 Sending {kw}_Cookies.zip "
+                    f"({kw_idx}/{len(keywords)}) — "
+                    f"{len(kw_cookie_files)} sets, {kw_count:,} cookies..."
+                )
                 kw_zip = kw_dir / f"{kw}_Cookies.zip"
                 with zipfile.ZipFile(
-                    kw_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1,
+                    kw_zip, "w",
+                    compression=zipfile.ZIP_DEFLATED,
+                    compresslevel=1,
                 ) as z:
                     for p in kw_cookie_files:
                         z.write(p, arcname=p.relative_to(kw_dir).as_posix())
@@ -591,7 +664,7 @@ async def _run_job(
                             filename=kw_zip.name,
                             caption=(
                                 f"🔑 {kw} — {len(kw_cookie_files)} set(s), "
-                                f"{kw_count} cookies"
+                                f"{kw_count:,} cookies"
                             ),
                         )
                     sent_count += 1
@@ -603,7 +676,7 @@ async def _run_job(
                         int(len(kw_cookie_files) * tgt / kw_zip_size),
                     )
                     for ps in range(0, len(kw_cookie_files), fpp):
-                        pf = kw_cookie_files[ps:ps + fpp]
+                        pf = kw_cookie_files[ps : ps + fpp]
                         pi = ps // fpp
                         pn = (
                             f"{kw}_Cookies.zip" if pi == 0
@@ -618,7 +691,9 @@ async def _run_job(
                             for p in pf:
                                 z.write(
                                     p,
-                                    arcname=p.relative_to(kw_dir).as_posix(),
+                                    arcname=p.relative_to(
+                                        kw_dir
+                                    ).as_posix(),
                                 )
                         if pp.stat().st_size > DOC_UPLOAD_LIMIT:
                             continue
@@ -636,7 +711,7 @@ async def _run_job(
             elapsed = int(time.time() - started)
             await _edit(
                 f"✅ Done! Sent {sent_count} keyword zip(s) "
-                f"({grand_cookie_count} cookies total).\n"
+                f"({grand_cookie_count:,} cookies total).\n"
                 f"⚡ Avg speed: {_human_speed(speed)}"
             )
             job_status = "success" if not errors else "partial"

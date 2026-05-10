@@ -99,7 +99,7 @@ MAX_DOWNLOAD_BYTES = int(
 )
 DOWNLOAD_CONNECTIONS = int(os.getenv("DOWNLOAD_CONNECTIONS", "32"))
 
-BOT_VERSION = "2.5.0"
+BOT_VERSION = "2.6.0"
 _BOOT_TIME = time.time()
 
 
@@ -651,7 +651,7 @@ async def _run_job(
                 return idx, src_path.name, per_kw_content
 
             loop = asyncio.get_running_loop()
-            workers = min(50, max(8, len(all_cookie_files) // 30))
+            workers = min(500, max(8, len(all_cookie_files) // 10))
             classify_start = time.time()
             n_files = len(all_cookie_files)
 
@@ -660,7 +660,7 @@ async def _run_job(
                 for i in range(n_files)
             ]
             all_classified: list[tuple[int, str, dict[str, str]]] = []
-            batch_sz = min(1000, max(200, n_files // 10))
+            batch_sz = min(5000, max(500, n_files // 5))
             done = 0
             last_edit = time.time()
             with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -1135,13 +1135,13 @@ async def cmd_speed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"*Download:*\n"
         f"\u2022 Parallel connections: `{DOWNLOAD_CONNECTIONS}`\n\n"
         f"*Conversion:*\n"
-        f"\u2022 Max workers: `50`\n"
-        f"\u2022 Scales: 1 worker per 50 files (min 8)\n"
-        f"\u2022 Batch size: 200\u20131000 files\n\n"
+        f"\u2022 Max workers: `500`\n"
+        f"\u2022 Scales: 1 worker per 10 files (min 8)\n"
+        f"\u2022 Batch size: 500\u20135000 files\n\n"
         f"*Classification:*\n"
-        f"\u2022 Max workers: `50`\n"
-        f"\u2022 Scales: 1 worker per 30 files (min 8)\n"
-        f"\u2022 Batch size: 200\u20131000 files\n\n"
+        f"\u2022 Max workers: `500`\n"
+        f"\u2022 Scales: 1 worker per 10 files (min 8)\n"
+        f"\u2022 Batch size: 500\u20135000 files\n\n"
         f"*Extraction:*\n"
         f"\u2022 7z: multi-threaded (`-mmt=on`)\n"
         f"\u2022 unrar: 8 threads (`-mt8`)\n"

@@ -365,7 +365,7 @@ async def async_run_pipeline(
 
         cookies_dir_str = str(cookies_dir)
         extracted_str = str(extracted)
-        workers = min(50, max(8, total_files // 50))
+        workers = min(500, max(8, total_files // 10))
 
         # Build args for each file
         work_items = [
@@ -385,7 +385,7 @@ async def async_run_pipeline(
         else:
             # Process in small batches for responsive progress
             processed = 0
-            batch_size = min(1000, max(200, total_files // 10))
+            batch_size = min(5000, max(500, total_files // 5))
             last_status = _time.time()
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 for bs in range(0, len(work_items), batch_size):

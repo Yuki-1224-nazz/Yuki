@@ -383,26 +383,23 @@ async def async_run_pipeline(
                     result.cookie_files.append(path)
                     result.cookie_count += count
         else:
-            # Process in small batches for responsive progress
+            # Submit ALL work at once, stream results as they finish
             processed = 0
-            batch_size = min(5000, max(500, total_files // 5))
             last_status = _time.time()
             with ThreadPoolExecutor(max_workers=workers) as pool:
-                for bs in range(0, len(work_items), batch_size):
-                    batch = work_items[bs : bs + batch_size]
-                    futs = [
-                        loop.run_in_executor(
-                            pool, _scan_and_convert_one, item,
-                        )
-                        for item in batch
-                    ]
-                    batch_results = await asyncio.gather(*futs)
-                    for r in batch_results:
-                        if r is not None:
-                            path, count, _rows = r
-                            result.cookie_files.append(path)
-                            result.cookie_count += count
-                    processed += len(batch)
+                futs = [
+                    loop.run_in_executor(
+                        pool, _scan_and_convert_one, item,
+                    )
+                    for item in work_items
+                ]
+                for coro in asyncio.as_completed(futs):
+                    r = await coro
+                    if r is not None:
+                        path, count, _rows = r
+                        result.cookie_files.append(path)
+                        result.cookie_count += count
+                    processed += 1
                     now = _time.time()
                     if now - last_status >= 2:
                         last_status = now

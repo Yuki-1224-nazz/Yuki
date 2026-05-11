@@ -660,19 +660,17 @@ async def _run_job(
                 for i in range(n_files)
             ]
             all_classified: list[tuple[int, str, dict[str, str]]] = []
-            batch_sz = min(5000, max(500, n_files // 5))
             done = 0
             last_edit = time.time()
             with ThreadPoolExecutor(max_workers=workers) as pool:
-                for bs in range(0, len(items), batch_sz):
-                    batch = items[bs : bs + batch_sz]
-                    futs = [
-                        loop.run_in_executor(pool, _classify_one, it)
-                        for it in batch
-                    ]
-                    results = await asyncio.gather(*futs)
-                    all_classified.extend(results)
-                    done += len(batch)
+                futs = [
+                    loop.run_in_executor(pool, _classify_one, it)
+                    for it in items
+                ]
+                for coro in asyncio.as_completed(futs):
+                    r = await coro
+                    all_classified.append(r)
+                    done += 1
                     now = time.time()
                     if now - last_edit >= 2:
                         last_edit = now

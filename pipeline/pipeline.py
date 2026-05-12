@@ -58,6 +58,48 @@ COOKIE_FILENAME_HINTS: tuple[str, ...] = (
     "passwords-cookies",
 )
 
+# ULP (User Login Password) filename hints
+ULP_FILENAME_HINTS: tuple[str, ...] = (
+    "password",
+    "passwords",
+    "passwords.txt",
+    "login",
+    "logins",
+    "credentials",
+    "all passwords",
+)
+
+# Regex patterns for extracting credentials (from v4.py)
+_ULP_PATTERNS = [
+    re.compile(
+        r"URL:\s*(https?://\S+)\s+USER:\s*(\S+)\s+PASS:\s*(\S+)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"SOFT:\s*Chrome Profile.*\nURL:\s*(\S+)\nUSER:\s*(\S+)\nPASS:\s*(\S+)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"SOFT:\s*(?:.*?)\s*URL:\s*(\S+)\s*USER:\s*(\S+)\s*PASS:\s*(\S+)",
+        re.IGNORECASE,
+    ),
+    re.compile(r"USER:\s*(\S+)\s*PASS:\s*(\S+)", re.IGNORECASE),
+]
+
+
+def extract_credentials_from_text(text: str) -> Optional[str]:
+    """Extract user:pass from a log file block.
+
+    Returns ``"user:pass"`` (no URL) or ``None``.
+    """
+    for pat in _ULP_PATTERNS:
+        m = pat.search(text)
+        if m:
+            groups = m.groups()
+            # Last two groups are always USER and PASS
+            return f"{groups[-2]}:{groups[-1]}"
+    return None
+
 StatusCallback = Callable[[str], None]
 """``status(message)`` — called by the pipeline to report progress."""
 
@@ -69,6 +111,9 @@ class PipelineResult:
     cookie_files: List[Path] = field(default_factory=list)
     cookie_count: int = 0
     bytes_read: int = 0
+    # ULP mode results
+    ulp_credentials: set = field(default_factory=set)
+    ulp_count: int = 0
 
 
 def _safe_name(name: str) -> str:
@@ -204,6 +249,82 @@ def _scan_and_convert_one(
     return Path(out_path), len(rows), rows
 
 
+_MAX_ULP_FILE_BYTES = 1024 * 1024  # 1 MB — password files can be slightly larger
+
+
+def _scan_and_extract_ulp(
+    args: tuple,
+) -> Optional[tuple[str, int]]:
+    """Scan a file for ULP credentials (user:pass).
+
+    Returns (credentials_text, count) or None.
+    Each credential is one ``user:pass`` line, deduplicated within the file.
+    """
+    idx, file_path_str, kw_lowers = args
+    name = os.path.basename(file_path_str)
+    lname = name.lower()
+
+    # Accept .txt files and files with ULP hints
+    is_hint = any(h in lname for h in ULP_FILENAME_HINTS)
+    if not is_hint and not lname.endswith(".txt"):
+        return None
+
+    try:
+        size = os.path.getsize(file_path_str)
+        if size == 0 or size > _MAX_ULP_FILE_BYTES:
+            return None
+    except OSError:
+        return None
+
+    try:
+        fd = os.open(file_path_str, os.O_RDONLY)
+        try:
+            raw = os.read(fd, _MAX_ULP_FILE_BYTES)
+        finally:
+            os.close(fd)
+    except OSError:
+        return None
+
+    text = raw.decode("utf-8", errors="replace")
+
+    # Try block-level extraction first (structured logs)
+    cred = extract_credentials_from_text(text)
+    creds: set[str] = set()
+    if cred:
+        creds.add(cred)
+
+    # Also scan line-by-line for simpler formats like "user:pass" or
+    # "email@example.com:password123"
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # Match user:pass patterns (email:pass, user:pass)
+        if ":" in line and len(line) < 500:
+            parts = line.split(":", 1)
+            user_part = parts[0].strip()
+            pass_part = parts[1].strip() if len(parts) > 1 else ""
+            if user_part and pass_part and " " not in user_part:
+                creds.add(f"{user_part}:{pass_part}")
+
+    if not creds:
+        return None
+
+    # Apply keyword filtering if keywords are provided
+    if kw_lowers:
+        filtered: set[str] = set()
+        for c in creds:
+            low = c.lower()
+            if any(kw in low for kw in kw_lowers):
+                filtered.add(c)
+        creds = filtered
+        if not creds:
+            return None
+
+    result_text = "\n".join(sorted(creds))
+    return result_text, len(creds)
+
+
 def _zip_results(zip_path: Path, files: Sequence[Path], root: Path) -> None:
     zip_path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(
@@ -229,6 +350,7 @@ async def async_run_pipeline(
     on_progress: Optional[ProgressCallback] = None,
     num_connections: int = 8,
     skip_zip: bool = False,
+    mode: str = "cookie",
 ) -> PipelineResult:
     """Async version of run_pipeline — uses aiohttp for faster downloads.
 
@@ -299,6 +421,14 @@ async def async_run_pipeline(
     # 3. Detect archive type
     kind = detect_archive_kind(download_path)
 
+    # Precompute keyword lowercase list (used by both archive and plain paths)
+    kw_lowers: List[str] = []
+    if keywords:
+        kw_lowers = [
+            k.strip().lower() for k in keywords
+            if k and k.strip()
+        ]
+
     if kind is not None:
         dl_size_mb = download_path.stat().st_size / (1024 * 1024)
         status(
@@ -348,68 +478,106 @@ async def async_run_pipeline(
 
         # Combined scan + convert in ONE pass (no separate scan step)
         convert_start = _time.time()
-        status("🔄 Scanning & converting...")
         all_files = await loop.run_in_executor(
             None, lambda: _fast_listdir(str(extracted))
         )
         total_files = len(all_files)
-        status(f"🔄 Processing {total_files:,} files...")
 
-        # Precompute keyword lowercase list
-        kw_lowers: List[str] = []
-        if keywords:
-            kw_lowers = [
-                k.strip().lower() for k in keywords
-                if k and k.strip()
-            ]
-
-        cookies_dir_str = str(cookies_dir)
-        extracted_str = str(extracted)
         workers = min(500, max(8, total_files // 10))
 
-        # Build args for each file
-        work_items = [
-            (i, fp, cookies_dir_str, extracted_str, kw_lowers)
-            for i, fp in enumerate(all_files, start=1)
-        ]
-        # Free the list early
-        del all_files
+        if mode == "ulp":
+            # --- ULP mode: extract user:pass credentials ---
+            status(f"🔑 Scanning {total_files:,} files for credentials...")
+            work_items_ulp = [
+                (i, fp, kw_lowers)
+                for i, fp in enumerate(all_files, start=1)
+            ]
+            del all_files
 
-        if len(work_items) <= 50:
-            for item in work_items:
-                r = _scan_and_convert_one(item)
-                if r is not None:
-                    path, count, _rows = r
-                    result.cookie_files.append(path)
-                    result.cookie_count += count
+            if len(work_items_ulp) <= 50:
+                for item in work_items_ulp:
+                    r = _scan_and_extract_ulp(item)
+                    if r is not None:
+                        cred_text, count = r
+                        for line in cred_text.splitlines():
+                            if line.strip():
+                                result.ulp_credentials.add(line.strip())
+                        result.ulp_count = len(result.ulp_credentials)
+            else:
+                processed = 0
+                last_status = _time.time()
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futs = [
+                        loop.run_in_executor(
+                            pool, _scan_and_extract_ulp, item,
+                        )
+                        for item in work_items_ulp
+                    ]
+                    for coro in asyncio.as_completed(futs):
+                        r = await coro
+                        if r is not None:
+                            cred_text, count = r
+                            for line in cred_text.splitlines():
+                                if line.strip():
+                                    result.ulp_credentials.add(line.strip())
+                            result.ulp_count = len(result.ulp_credentials)
+                        processed += 1
+                        now = _time.time()
+                        if now - last_status >= 2:
+                            last_status = now
+                            elapsed_conv = now - convert_start
+                            status(
+                                f"🔑 Scanning... "
+                                f"{processed:,}/{total_files:,} files "
+                                f"({result.ulp_count:,} credentials, "
+                                f"{elapsed_conv:.0f}s)"
+                            )
         else:
-            # Submit ALL work at once, stream results as they finish
-            processed = 0
-            last_status = _time.time()
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futs = [
-                    loop.run_in_executor(
-                        pool, _scan_and_convert_one, item,
-                    )
-                    for item in work_items
-                ]
-                for coro in asyncio.as_completed(futs):
-                    r = await coro
+            # --- Cookie mode: scan + convert cookies ---
+            status(f"🔄 Processing {total_files:,} files...")
+            cookies_dir_str = str(cookies_dir)
+            extracted_str = str(extracted)
+
+            work_items = [
+                (i, fp, cookies_dir_str, extracted_str, kw_lowers)
+                for i, fp in enumerate(all_files, start=1)
+            ]
+            del all_files
+
+            if len(work_items) <= 50:
+                for item in work_items:
+                    r = _scan_and_convert_one(item)
                     if r is not None:
                         path, count, _rows = r
                         result.cookie_files.append(path)
                         result.cookie_count += count
-                    processed += 1
-                    now = _time.time()
-                    if now - last_status >= 2:
-                        last_status = now
-                        elapsed_conv = now - convert_start
-                        status(
-                            f"🔄 Converting... "
-                            f"{processed:,}/{total_files:,} files "
-                            f"({result.cookie_count:,} cookies, "
-                            f"{elapsed_conv:.0f}s)"
+            else:
+                processed = 0
+                last_status = _time.time()
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futs = [
+                        loop.run_in_executor(
+                            pool, _scan_and_convert_one, item,
                         )
+                        for item in work_items
+                    ]
+                    for coro in asyncio.as_completed(futs):
+                        r = await coro
+                        if r is not None:
+                            path, count, _rows = r
+                            result.cookie_files.append(path)
+                            result.cookie_count += count
+                        processed += 1
+                        now = _time.time()
+                        if now - last_status >= 2:
+                            last_status = now
+                            elapsed_conv = now - convert_start
+                            status(
+                                f"🔄 Converting... "
+                                f"{processed:,}/{total_files:,} files "
+                                f"({result.cookie_count:,} cookies, "
+                                f"{elapsed_conv:.0f}s)"
+                            )
 
         # Clean up extracted files to free disk
         try:
@@ -417,18 +585,45 @@ async def async_run_pipeline(
         except OSError:
             pass
     else:
-        status("⚙ Processing... (parsing as plain cookie file)")
-        rows: List[CookieRow] = []
-        with open(download_path, "r", encoding="utf-8", errors="replace") as f:
-            for row in iter_cookies_from_lines(f, keywords=keywords):
-                rows.append(row)
+        if mode == "ulp":
+            status("⚙ Processing... (parsing as plain text for credentials)")
+            try:
+                with open(download_path, "r", encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+                cred = extract_credentials_from_text(text)
+                if cred:
+                    result.ulp_credentials.add(cred)
+                for line in text.splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if ":" in line and len(line) < 500:
+                        parts = line.split(":", 1)
+                        u = parts[0].strip()
+                        p = parts[1].strip() if len(parts) > 1 else ""
+                        if u and p and " " not in u:
+                            result.ulp_credentials.add(f"{u}:{p}")
+                if kw_lowers:
+                    result.ulp_credentials = {
+                        c for c in result.ulp_credentials
+                        if any(kw in c.lower() for kw in kw_lowers)
+                    }
+                result.ulp_count = len(result.ulp_credentials)
+            except Exception:
+                pass
+        else:
+            status("⚙ Processing... (parsing as plain cookie file)")
+            rows: List[CookieRow] = []
+            with open(download_path, "r", encoding="utf-8", errors="replace") as f:
+                for row in iter_cookies_from_lines(f, keywords=keywords):
+                    rows.append(row)
 
-        if rows:
-            status(f"🔄 Converting... (1 cookie set, {len(rows)} cookies)")
-            out_path = cookies_dir / "0001_cookies.txt"
-            write_netscape_file(out_path, rows)
-            result.cookie_files.append(out_path)
-            result.cookie_count = len(rows)
+            if rows:
+                status(f"🔄 Converting... (1 cookie set, {len(rows)} cookies)")
+                out_path = cookies_dir / "0001_cookies.txt"
+                write_netscape_file(out_path, rows)
+                result.cookie_files.append(out_path)
+                result.cookie_count = len(rows)
 
     # 4. Zip results (skip if caller handles zipping)
     if not skip_zip:

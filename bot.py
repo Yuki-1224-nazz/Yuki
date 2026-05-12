@@ -549,15 +549,17 @@ async def _send_ulp_results(
     errors: list[str],
     output_dir: Path,
     _edit: Callable,
+    *,
+    ulp_per_keyword: Optional[dict] = None,
 ) -> None:
     """Send ULP (user:pass) results as .txt files (per-keyword or single)."""
     total_cred_count = len(all_credentials)
 
     if len(keywords) > 1:
-        # Per-keyword .txt files
+        # Per-keyword .txt files — use pipeline's per-keyword data
         _active_jobs[user_id] = "Splitting by keywords..."
         await _edit(
-            f"🔑 Classifying {total_cred_count:,} credentials "
+            f"🔑 Sending {total_cred_count:,} credentials "
             f"by {len(keywords)} keywords..."
         )
 
@@ -566,10 +568,14 @@ async def _send_ulp_results(
 
         for kw_idx, kw in enumerate(keywords, start=1):
             kw_lower = kw.strip().lower()
-            matched = sorted(
-                c for c in all_credentials
-                if kw_lower in c.lower()
-            )
+            # Use pre-classified per-keyword data from pipeline
+            if ulp_per_keyword and kw_lower in ulp_per_keyword:
+                matched = sorted(ulp_per_keyword[kw_lower])
+            else:
+                matched = sorted(
+                    c for c in all_credentials
+                    if kw_lower in c.lower()
+                )
             if not matched:
                 continue
 
@@ -803,8 +809,13 @@ async def _run_job(
     workdir = Path(tempfile.mkdtemp(prefix="logs2cookie-"))
     try:
         # Run all URLs concurrently
-        # When multiple keywords: download without filtering, then split per keyword
-        pipeline_keywords = keywords if len(keywords) <= 1 else []
+        # Cookie mode: multiple keywords → no pipeline filter, classify later
+        # ULP mode: ALWAYS pass keywords to pipeline so keyword matching
+        #           uses the full URL context (not just user:pass output)
+        if mode == "ulp":
+            pipeline_keywords = keywords
+        else:
+            pipeline_keywords = keywords if len(keywords) <= 1 else []
 
         async def _run_one(idx: int, url: str, pwd: Optional[str]) -> Optional[object]:
             sub_workdir = workdir / f"job_{idx}"
@@ -836,6 +847,7 @@ async def _run_job(
         all_cookie_files: list[Path] = []
         total_cookie_count = 0
         all_ulp_credentials: set[str] = set()
+        all_ulp_per_keyword: dict[str, set[str]] = {}
         errors: list[str] = []
         output_dir = workdir / "merged_output"
         cookies_dir = output_dir / "cookies"
@@ -850,6 +862,10 @@ async def _run_job(
             total_bytes_read += res.bytes_read
             if mode == "ulp":
                 all_ulp_credentials.update(res.ulp_credentials)
+                for kw, creds_set in res.ulp_per_keyword.items():
+                    if kw not in all_ulp_per_keyword:
+                        all_ulp_per_keyword[kw] = set()
+                    all_ulp_per_keyword[kw].update(creds_set)
             else:
                 total_cookie_count += res.cookie_count
                 for src_file in res.cookie_files:
@@ -909,6 +925,7 @@ async def _run_job(
                 context, chat_id, user_id, username, urls,
                 all_ulp_credentials, keywords, total_bytes_read,
                 speed, elapsed, errors, output_dir, _edit,
+                ulp_per_keyword=all_ulp_per_keyword,
             )
             return
 

@@ -87,18 +87,32 @@ _ULP_PATTERNS = [
 ]
 
 
-def extract_credentials_from_text(text: str) -> Optional[str]:
-    """Extract user:pass from a log file block.
+def extract_credentials_from_text(
+    text: str,
+    kw_lowers: Optional[List[str]] = None,
+) -> List[str]:
+    """Extract user:pass pairs from a log file block.
 
-    Returns ``"user:pass"`` (no URL) or ``None``.
+    Returns a list of ``"user:pass"`` strings (no URL).
+    When *kw_lowers* is given, only credentials whose **full match
+    context** (including URL) contains at least one keyword are kept.
     """
+    results: list[str] = []
+    seen: set[str] = set()
     for pat in _ULP_PATTERNS:
-        m = pat.search(text)
-        if m:
+        for m in pat.finditer(text):
             groups = m.groups()
-            # Last two groups are always USER and PASS
-            return f"{groups[-2]}:{groups[-1]}"
-    return None
+            cred = f"{groups[-2]}:{groups[-1]}"
+            if cred in seen:
+                continue
+            # Keyword filter checks the entire matched text (incl. URL)
+            if kw_lowers:
+                context_low = m.group(0).lower()
+                if not any(kw in context_low for kw in kw_lowers):
+                    continue
+            seen.add(cred)
+            results.append(cred)
+    return results
 
 StatusCallback = Callable[[str], None]
 """``status(message)`` — called by the pipeline to report progress."""
@@ -114,6 +128,8 @@ class PipelineResult:
     # ULP mode results
     ulp_credentials: set = field(default_factory=set)
     ulp_count: int = 0
+    # Per-keyword ULP results (keyword -> set of credentials)
+    ulp_per_keyword: dict = field(default_factory=dict)
 
 
 def _safe_name(name: str) -> str:
@@ -254,11 +270,14 @@ _MAX_ULP_FILE_BYTES = 1024 * 1024  # 1 MB — password files can be slightly lar
 
 def _scan_and_extract_ulp(
     args: tuple,
-) -> Optional[tuple[str, int]]:
+) -> Optional[tuple[str, int, Optional[dict]]]:
     """Scan a file for ULP credentials (user:pass).
 
-    Returns (credentials_text, count) or None.
-    Each credential is one ``user:pass`` line, deduplicated within the file.
+    Returns ``(credentials_text, count, per_kw_dict)`` or ``None``.
+    *per_kw_dict* maps keyword→set[cred] when multiple keywords are given.
+    Uses structured pattern matching (URL/USER/PASS blocks).
+    Keyword filtering matches against the FULL context (including URL)
+    so keywords like ``com.garena.gaslite`` match against the URL field.
     """
     idx, file_path_str, kw_lowers = args
     name = os.path.basename(file_path_str)
@@ -287,42 +306,27 @@ def _scan_and_extract_ulp(
 
     text = raw.decode("utf-8", errors="replace")
 
-    # Try block-level extraction first (structured logs)
-    cred = extract_credentials_from_text(text)
-    creds: set[str] = set()
-    if cred:
-        creds.add(cred)
-
-    # Also scan line-by-line for simpler formats like "user:pass" or
-    # "email@example.com:password123"
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        # Match user:pass patterns (email:pass, user:pass)
-        if ":" in line and len(line) < 500:
-            parts = line.split(":", 1)
-            user_part = parts[0].strip()
-            pass_part = parts[1].strip() if len(parts) > 1 else ""
-            if user_part and pass_part and " " not in user_part:
-                creds.add(f"{user_part}:{pass_part}")
-
-    if not creds:
-        return None
-
-    # Apply keyword filtering if keywords are provided
-    if kw_lowers:
-        filtered: set[str] = set()
-        for c in creds:
-            low = c.lower()
-            if any(kw in low for kw in kw_lowers):
-                filtered.add(c)
-        creds = filtered
+    if not kw_lowers:
+        # No keywords — extract all credentials
+        creds = extract_credentials_from_text(text)
         if not creds:
             return None
+        return "\n".join(creds), len(creds), None
 
-    result_text = "\n".join(sorted(creds))
-    return result_text, len(creds)
+    # With keywords: match each keyword against full URL context
+    # and track which credentials belong to which keyword
+    per_kw: dict[str, set[str]] = {}
+    all_creds: set[str] = set()
+    for kw in kw_lowers:
+        matched = extract_credentials_from_text(text, kw_lowers=[kw])
+        if matched:
+            per_kw[kw] = set(matched)
+            all_creds.update(matched)
+
+    if not all_creds:
+        return None
+
+    return "\n".join(all_creds), len(all_creds), per_kw
 
 
 def _zip_results(zip_path: Path, files: Sequence[Path], root: Path) -> None:
@@ -494,15 +498,25 @@ async def async_run_pipeline(
             ]
             del all_files
 
+            def _process_ulp_result(r: Optional[tuple]) -> None:
+                if r is None:
+                    return
+                cred_text, count, per_kw = r
+                for line in cred_text.splitlines():
+                    stripped = line.strip()
+                    if stripped:
+                        result.ulp_credentials.add(stripped)
+                # Merge per-keyword results
+                if per_kw:
+                    for kw, creds_set in per_kw.items():
+                        if kw not in result.ulp_per_keyword:
+                            result.ulp_per_keyword[kw] = set()
+                        result.ulp_per_keyword[kw].update(creds_set)
+                result.ulp_count = len(result.ulp_credentials)
+
             if len(work_items_ulp) <= 50:
                 for item in work_items_ulp:
-                    r = _scan_and_extract_ulp(item)
-                    if r is not None:
-                        cred_text, count = r
-                        for line in cred_text.splitlines():
-                            if line.strip():
-                                result.ulp_credentials.add(line.strip())
-                        result.ulp_count = len(result.ulp_credentials)
+                    _process_ulp_result(_scan_and_extract_ulp(item))
             else:
                 processed = 0
                 last_status = _time.time()
@@ -514,13 +528,7 @@ async def async_run_pipeline(
                         for item in work_items_ulp
                     ]
                     for coro in asyncio.as_completed(futs):
-                        r = await coro
-                        if r is not None:
-                            cred_text, count = r
-                            for line in cred_text.splitlines():
-                                if line.strip():
-                                    result.ulp_credentials.add(line.strip())
-                            result.ulp_count = len(result.ulp_credentials)
+                        _process_ulp_result(await coro)
                         processed += 1
                         now = _time.time()
                         if now - last_status >= 2:
@@ -590,24 +598,11 @@ async def async_run_pipeline(
             try:
                 with open(download_path, "r", encoding="utf-8", errors="replace") as f:
                     text = f.read()
-                cred = extract_credentials_from_text(text)
-                if cred:
-                    result.ulp_credentials.add(cred)
-                for line in text.splitlines():
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    if ":" in line and len(line) < 500:
-                        parts = line.split(":", 1)
-                        u = parts[0].strip()
-                        p = parts[1].strip() if len(parts) > 1 else ""
-                        if u and p and " " not in u:
-                            result.ulp_credentials.add(f"{u}:{p}")
-                if kw_lowers:
-                    result.ulp_credentials = {
-                        c for c in result.ulp_credentials
-                        if any(kw in c.lower() for kw in kw_lowers)
-                    }
+                creds = extract_credentials_from_text(
+                    text, kw_lowers=kw_lowers or None,
+                )
+                for c in creds:
+                    result.ulp_credentials.add(c)
                 result.ulp_count = len(result.ulp_credentials)
             except Exception:
                 pass

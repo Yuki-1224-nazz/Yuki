@@ -293,9 +293,9 @@ async def on_mode_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "Send me one or more *direct download URLs* to your logs "
             "(comma or space separated). I accept any `http(s)` link "
             "— zip, 7z, rar, tokenised CDN paths, or `gofile.io` "
-            "links.\n\n"
-            "At any time you can send /cancel to abort.",
+            "links.",
             parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_EXIT_KB,
         )
         return ASK_URL
     elif data == "mode_ulp":
@@ -304,9 +304,9 @@ async def on_mode_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "🔑 *Logs to ULP* mode selected.\n\n"
             "Send me one or more *direct download URLs* to your logs "
             "(comma or space separated). I'll extract all `user:pass` "
-            "credentials from the archive.\n\n"
-            "At any time you can send /cancel to abort.",
+            "credentials from the archive.",
             parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_EXIT_KB,
         )
         return ASK_URL
     return ASK_MODE
@@ -388,6 +388,20 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "• Supports ZIP, 7z, RAR (including RAR5)\n"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    return ConversationHandler.END
+
+
+_EXIT_KB = InlineKeyboardMarkup([
+    [InlineKeyboardButton("❌ Exit", callback_data="exit_conv")],
+])
+
+
+async def _on_exit_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle the exit button pressed at any step."""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("👋 Exited. Send /start to begin again.")
+    context.user_data.clear()
     return ConversationHandler.END
 
 
@@ -1496,15 +1510,18 @@ def build_app() -> Application:
                 MessageHandler(filters.TEXT & ~filters.COMMAND, on_mode_text),
             ],
             ASK_URL: [
+                CallbackQueryHandler(_on_exit_button, pattern="^exit_conv$"),
                 CommandHandler("cancel", cmd_cancel),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, on_url),
             ],
             ASK_PASSWORD: [
+                CallbackQueryHandler(_on_exit_button, pattern="^exit_conv$"),
                 CommandHandler("cancel", cmd_cancel),
                 CommandHandler("skip", on_password),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, on_password),
             ],
             ASK_KEYWORDS: [
+                CallbackQueryHandler(_on_exit_button, pattern="^exit_conv$"),
                 CommandHandler("cancel", cmd_cancel),
                 CommandHandler("skip", on_keywords),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, on_keywords),

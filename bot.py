@@ -262,8 +262,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "👋 *logs-to-cookie & logs-to-ulp*\n\n"
         "Select a mode:\n\n"
         "1️⃣  *Logs to Cookie* — Extract Netscape cookies\n"
-        "2️⃣  *Logs to ULP* — Extract credentials (user:pass)\n\n"
-        "Send `1` or `2` to choose, or /cancel to abort."
+        "2️⃣  *Logs to ULP* — Extract credentials (user:pass)\n"
+        "0️⃣  *Exit*\n\n"
+        "Send `1`, `2`, or `0` to choose."
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
     return ASK_MODE
@@ -275,7 +276,11 @@ async def on_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if text.startswith("/"):
         return await cmd_cancel(update, context)
 
-    if text == "1":
+    if text == "0":
+        await update.message.reply_text("👋 Exited. Send /start to begin again.")
+        context.user_data.clear()
+        return ConversationHandler.END
+    elif text == "1":
         context.user_data["mode"] = "cookie"
         await update.message.reply_text(
             "🍪 *Logs to Cookie* mode selected.\n\n"
@@ -300,7 +305,7 @@ async def on_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ASK_URL
     else:
         await update.message.reply_text(
-            "Please send `1` for Logs to Cookie or `2` for Logs to ULP.",
+            "Please send `1` for Cookie, `2` for ULP, or `0` to exit.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return ASK_MODE

@@ -104,10 +104,16 @@ _ULP_QUICK_MARKERS = (b"URL:", b"url:", b"USER:", b"user:", b"PASS:", b"pass:")
 def extract_credentials_from_text(
     text: str,
     kw_lowers: Optional[List[str]] = None,
+    *,
+    include_url: bool = False,
 ) -> List[str]:
-    """Extract user:pass pairs from a log file block.
+    """Extract credentials from a log file block.
 
-    Returns a list of ``"user:pass"`` strings (no URL).
+    When *include_url* is ``False`` (default), returns ``"user:pass"``
+    strings.  When ``True``, returns ``"url:user:pass"`` strings (the
+    URL is included when the pattern captures one; otherwise the URL
+    part is omitted and the result is still ``"user:pass"``).
+
     When *kw_lowers* is given, only credentials whose **full match
     context** (including URL) contains at least one keyword are kept.
     """
@@ -116,10 +122,12 @@ def extract_credentials_from_text(
     for pat in _ULP_PATTERNS:
         for m in pat.finditer(text):
             groups = m.groups()
-            cred = f"{groups[-2]}:{groups[-1]}"
+            if include_url and len(groups) == 3:
+                cred = f"{groups[0]}:{groups[1]}:{groups[2]}"
+            else:
+                cred = f"{groups[-2]}:{groups[-1]}"
             if cred in seen:
                 continue
-            # Keyword filter checks the entire matched text (incl. URL)
             if kw_lowers:
                 context_low = m.group(0).lower()
                 if not any(kw in context_low for kw in kw_lowers):
@@ -321,15 +329,16 @@ def _is_ulp_candidate(file_path_str: str) -> bool:
 def _scan_and_extract_ulp(
     args: tuple,
 ) -> Optional[tuple[str, int, Optional[dict]]]:
-    """Scan a file for ULP credentials (user:pass).
+    """Scan a file for ULP credentials.
+
+    *args* is ``(idx, file_path_str, kw_lowers, include_url)``.
+    When *include_url* is ``True`` the output format is
+    ``url:user:pass``; otherwise ``user:pass``.
 
     Returns ``(credentials_text, count, per_kw_dict)`` or ``None``.
     *per_kw_dict* maps keyword→set[cred] when multiple keywords are given.
-    Uses structured pattern matching (URL/USER/PASS blocks).
-    Keyword filtering matches against the FULL context (including URL)
-    so keywords like ``com.garena.gaslite`` match against the URL field.
     """
-    idx, file_path_str, kw_lowers = args
+    idx, file_path_str, kw_lowers, include_url = args
 
     try:
         size = os.path.getsize(file_path_str)
@@ -355,7 +364,7 @@ def _scan_and_extract_ulp(
     text = raw.decode("utf-8", errors="replace")
 
     if not kw_lowers:
-        creds = extract_credentials_from_text(text)
+        creds = extract_credentials_from_text(text, include_url=include_url)
         if not creds:
             return None
         return "\n".join(creds), len(creds), None
@@ -365,7 +374,9 @@ def _scan_and_extract_ulp(
     per_kw: dict[str, set[str]] = {}
     all_creds: set[str] = set()
     for kw in kw_lowers:
-        matched = extract_credentials_from_text(text, kw_lowers=[kw])
+        matched = extract_credentials_from_text(
+            text, kw_lowers=[kw], include_url=include_url,
+        )
         if matched:
             per_kw[kw] = set(matched)
             all_creds.update(matched)
@@ -530,7 +541,8 @@ async def async_run_pipeline(
         # Combined scan + convert in ONE pass (no separate scan step)
         convert_start = _time.time()
 
-        if mode == "ulp":
+        if mode in ("ulp", "ulp_url"):
+            include_url = mode == "ulp_url"
             # ULP mode: use specialized lister that filters during
             # traversal — never builds a 103K item list in memory.
             ulp_files, total_files = await loop.run_in_executor(
@@ -544,7 +556,7 @@ async def async_run_pipeline(
 
             ulp_workers = min(500, max(8, ulp_count // 10))
             work_items_ulp = [
-                (i, fp, kw_lowers)
+                (i, fp, kw_lowers, include_url)
                 for i, fp in enumerate(ulp_files, start=1)
             ]
             del ulp_files
@@ -648,13 +660,15 @@ async def async_run_pipeline(
         except OSError:
             pass
     else:
-        if mode == "ulp":
+        if mode in ("ulp", "ulp_url"):
+            include_url = mode == "ulp_url"
             status("⚙ Processing... (parsing as plain text for credentials)")
             try:
                 with open(download_path, "r", encoding="utf-8", errors="replace") as f:
                     text = f.read()
                 creds = extract_credentials_from_text(
                     text, kw_lowers=kw_lowers or None,
+                    include_url=include_url,
                 )
                 for c in creds:
                     result.ulp_credentials.add(c)

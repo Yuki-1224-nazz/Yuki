@@ -264,6 +264,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             InlineKeyboardButton("🍪 Logs to Cookie", callback_data="mode_cookie"),
             InlineKeyboardButton("🔑 Logs to ULP", callback_data="mode_ulp"),
         ],
+        [
+            InlineKeyboardButton("🌐 Logs to ULP (URL)", callback_data="mode_ulp_url"),
+        ],
         [InlineKeyboardButton("❌ Exit", callback_data="mode_exit")],
     ])
     text = (
@@ -309,6 +312,17 @@ async def on_mode_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             reply_markup=_EXIT_KB,
         )
         return ASK_URL
+    elif data == "mode_ulp_url":
+        context.user_data["mode"] = "ulp_url"
+        await query.edit_message_text(
+            "🌐 *Logs to ULP (URL)* mode selected.\n\n"
+            "Send me one or more *direct download URLs* to your logs "
+            "(comma or space separated). I'll extract all "
+            "`url:user:pass` credentials from the archive.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_EXIT_KB,
+        )
+        return ASK_URL
     return ASK_MODE
 
 
@@ -342,9 +356,19 @@ async def on_mode_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             parse_mode=ParseMode.MARKDOWN,
         )
         return ASK_URL
+    elif text == "3":
+        context.user_data["mode"] = "ulp_url"
+        await update.message.reply_text(
+            "🌐 *Logs to ULP (URL)* mode selected.\n\n"
+            "Send me one or more *direct download URLs* to your logs "
+            "(comma or space separated).\n\n"
+            "At any time you can send /cancel to abort.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return ASK_URL
     else:
         await update.message.reply_text(
-            "Please tap a button above, or send `1`, `2`, or `0`.",
+            "Please tap a button above, or send `1`, `2`, `3`, or `0`.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return ASK_MODE
@@ -380,8 +404,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "🔹 /cleanup — Clear temp files to free disk\n"
         "\n"
         "💡 *Tips:*\n"
-        "• Send `1` at start for Cookie mode, `2` for ULP mode\n"
+        "• Send `1` for Cookie, `2` for ULP, `3` for ULP (URL)\n"
         "• ULP mode extracts user:pass credentials\n"
+        "• ULP (URL) mode extracts url:user:pass credentials\n"
         "• Send multiple links (comma/space separated)\n"
         "• One password works for all links with same password\n"
         "• Multiple keywords → separate zip per keyword\n"
@@ -495,7 +520,7 @@ async def on_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         context.user_data["passwords"] = _parse_passwords(text, num_urls)
 
     mode = context.user_data.get("mode", "cookie")
-    if mode == "ulp":
+    if mode in ("ulp", "ulp_url"):
         await update.message.reply_text(
             "🔎 Send *keywords* to filter credentials by "
             "(comma-separated), or send /skip to keep all.",
@@ -551,8 +576,10 @@ async def _send_ulp_results(
     _edit: Callable,
     *,
     ulp_per_keyword: Optional[dict] = None,
+    mode: str = "ulp",
 ) -> None:
-    """Send ULP (user:pass) results as .txt files (per-keyword or single)."""
+    """Send ULP results as .txt files (per-keyword or single)."""
+    fmt_label = "url:user:pass" if mode == "ulp_url" else "user:pass"
     total_cred_count = len(all_credentials)
 
     if len(keywords) > 1:
@@ -669,7 +696,7 @@ async def _send_ulp_results(
                     filename=txt_path.name,
                     caption=(
                         f"🔑 {total_cred_count:,} credentials "
-                        f"(user:pass, deduplicated)\n"
+                        f"({fmt_label}, deduplicated)\n"
                         f"📡 read: {_human_bytes(total_bytes_read)} "
                         f"({_human_speed(speed)})\n"
                         f"⏱️ {elapsed}s"
@@ -812,7 +839,7 @@ async def _run_job(
         # Cookie mode: multiple keywords → no pipeline filter, classify later
         # ULP mode: ALWAYS pass keywords to pipeline so keyword matching
         #           uses the full URL context (not just user:pass output)
-        if mode == "ulp":
+        if mode in ("ulp", "ulp_url"):
             pipeline_keywords = keywords
         else:
             pipeline_keywords = keywords if len(keywords) <= 1 else []
@@ -860,7 +887,7 @@ async def _run_job(
             if not isinstance(res, PipelineResult):
                 continue
             total_bytes_read += res.bytes_read
-            if mode == "ulp":
+            if mode in ("ulp", "ulp_url"):
                 all_ulp_credentials.update(res.ulp_credentials)
                 for kw, creds_set in res.ulp_per_keyword.items():
                     if kw not in all_ulp_per_keyword:
@@ -877,7 +904,7 @@ async def _run_job(
         speed = total_bytes_read / (time.time() - started) if (time.time() - started) > 0 else 0
 
         has_results = (
-            len(all_ulp_credentials) > 0 if mode == "ulp"
+            len(all_ulp_credentials) > 0 if mode in ("ulp", "ulp_url")
             else len(all_cookie_files) > 0
         )
 
@@ -902,7 +929,7 @@ async def _run_job(
         if not has_results:
             no_result_msg = (
                 "ℹ️ Done — no credentials found."
-                if mode == "ulp"
+                if mode in ("ulp", "ulp_url")
                 else "ℹ️ Done — no matching cookies found."
             )
             await _edit(
@@ -915,17 +942,18 @@ async def _run_job(
                 user_id=user_id, username=username, urls=urls,
                 cookie_count=0, bytes_read=total_bytes_read,
                 elapsed=elapsed,
-                status="no_credentials" if mode == "ulp" else "no_cookies",
+                status="no_credentials" if mode in ("ulp", "ulp_url") else "no_cookies",
             ))
             return
 
         # === ULP MODE OUTPUT ===
-        if mode == "ulp":
+        if mode in ("ulp", "ulp_url"):
             await _send_ulp_results(
                 context, chat_id, user_id, username, urls,
                 all_ulp_credentials, keywords, total_bytes_read,
                 speed, elapsed, errors, output_dir, _edit,
                 ulp_per_keyword=all_ulp_per_keyword,
+                mode=mode,
             )
             return
 
@@ -1604,7 +1632,7 @@ def _check_extractor_binaries() -> None:
 async def _post_init(application: Application) -> None:
     """Register the bot menu commands after the application starts."""
     await application.bot.set_my_commands([
-        BotCommand("start", "Start — choose Cookie or ULP mode"),
+        BotCommand("start", "Start — choose Cookie, ULP, or ULP (URL) mode"),
         BotCommand("help", "Show all commands"),
         BotCommand("status", "Check active jobs"),
         BotCommand("settings", "View bot configuration"),

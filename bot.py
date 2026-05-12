@@ -492,11 +492,11 @@ async def _send_ulp_results(
     output_dir: Path,
     _edit: Callable,
 ) -> None:
-    """Send ULP (user:pass) results — per-keyword zips or single zip."""
+    """Send ULP (user:pass) results as .txt files (per-keyword or single)."""
     total_cred_count = len(all_credentials)
 
     if len(keywords) > 1:
-        # Per-keyword output
+        # Per-keyword .txt files
         _active_jobs[user_id] = "Splitting by keywords..."
         await _edit(
             f"🔑 Classifying {total_cred_count:,} credentials "
@@ -519,48 +519,53 @@ async def _send_ulp_results(
             content = "\n".join(matched) + "\n"
             content_bytes = content.encode("utf-8")
 
-            # Create zip in memory
             safe_kw = re.sub(r"[^A-Za-z0-9_-]+", "_", kw.strip())[:40] or "results"
-            zip_name = f"{safe_kw}_Results.zip"
-            zip_path = output_dir / zip_name
-            with zipfile.ZipFile(
-                zip_path, "w", compression=zipfile.ZIP_STORED,
-            ) as z:
-                z.writestr(f"{safe_kw}_credentials.txt", content_bytes)
+            txt_name = f"{safe_kw}_Results.txt"
+            txt_path = output_dir / txt_name
+            txt_path.write_bytes(content_bytes)
+            txt_size = txt_path.stat().st_size
 
-            zip_size = zip_path.stat().st_size
-            if zip_size > DOC_UPLOAD_LIMIT:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        f"⚠️ `{zip_name}` too large "
-                        f"({_human_bytes(zip_size)}), sending as text..."
-                    ),
-                    parse_mode=ParseMode.MARKDOWN,
+            if txt_size > DOC_UPLOAD_LIMIT:
+                # Split into multiple .txt parts
+                lines_per_part = max(1, int(
+                    len(matched) * DOC_UPLOAD_LIMIT * 0.8 / txt_size
+                ))
+                part_num = 0
+                for ps in range(0, len(matched), lines_per_part):
+                    part_creds = matched[ps:ps + lines_per_part]
+                    part_num += 1
+                    pname = (
+                        f"{safe_kw}_Results.txt" if part_num == 1
+                        else f"{safe_kw}_Results_{part_num}.txt"
+                    )
+                    ppath = output_dir / pname
+                    ppath.write_text("\n".join(part_creds) + "\n", encoding="utf-8")
+                    psize = ppath.stat().st_size
+                    if psize > DOC_UPLOAD_LIMIT:
+                        continue
+                    with open(ppath, "rb") as f:
+                        await context.bot.send_document(
+                            chat_id=chat_id,
+                            document=f,
+                            filename=pname,
+                            caption=(
+                                f"🔑 {kw} (part {part_num}) — "
+                                f"{len(part_creds):,} credentials"
+                            ),
+                        )
+            else:
+                await _edit(
+                    f"📤 Sending {txt_name} ({kw_idx}/{len(keywords)}) "
+                    f"— {len(matched):,} credentials..."
                 )
-                # Send raw text file instead
-                txt_path = output_dir / f"{safe_kw}_credentials.txt"
-                txt_path.write_bytes(content_bytes)
                 with open(txt_path, "rb") as f:
                     await context.bot.send_document(
                         chat_id=chat_id,
                         document=f,
-                        filename=f"{safe_kw}_credentials.txt",
-                        caption=f"🔑 {kw} — {len(matched):,} credentials",
-                    )
-            else:
-                await _edit(
-                    f"📤 Sending {zip_name} ({kw_idx}/{len(keywords)}) "
-                    f"— {len(matched):,} credentials..."
-                )
-                with open(zip_path, "rb") as f:
-                    await context.bot.send_document(
-                        chat_id=chat_id,
-                        document=f,
-                        filename=zip_name,
+                        filename=txt_name,
                         caption=(
                             f"🔑 {kw} — {len(matched):,} credentials\n"
-                            f"📦 {_human_bytes(zip_size)}"
+                            f"📄 {_human_bytes(txt_size)}"
                         ),
                     )
 
@@ -577,31 +582,27 @@ async def _send_ulp_results(
             elapsed=elapsed, status=job_status,
         ))
     else:
-        # Single or no keyword — one zip with all credentials
+        # Single or no keyword — one .txt file
         sorted_creds = sorted(all_credentials)
         content = "\n".join(sorted_creds) + "\n"
         content_bytes = content.encode("utf-8")
 
-        zip_path = output_dir / "ulp_results.zip"
-        with zipfile.ZipFile(
-            zip_path, "w", compression=zipfile.ZIP_STORED,
-        ) as z:
-            z.writestr("credentials.txt", content_bytes)
+        txt_path = output_dir / "ulp_results.txt"
+        txt_path.write_bytes(content_bytes)
+        txt_size = txt_path.stat().st_size
 
-        zip_size = zip_path.stat().st_size
-
-        if zip_size <= DOC_UPLOAD_LIMIT:
+        if txt_size <= DOC_UPLOAD_LIMIT:
             await _edit(
                 "📤 Uploading result...\n"
                 f"🔑 {total_cred_count:,} credentials (deduplicated)\n"
-                f"📦 zip: {_human_bytes(zip_size)}\n"
+                f"📄 {_human_bytes(txt_size)}\n"
                 f"⏱️ Elapsed: {elapsed}s"
             )
-            with open(zip_path, "rb") as f:
+            with open(txt_path, "rb") as f:
                 await context.bot.send_document(
                     chat_id=chat_id,
                     document=f,
-                    filename=zip_path.name,
+                    filename=txt_path.name,
                     caption=(
                         f"🔑 {total_cred_count:,} credentials "
                         f"(user:pass, deduplicated)\n"
@@ -611,33 +612,30 @@ async def _send_ulp_results(
                     ),
                 )
             await _edit(
-                f"✅ Done! Sent {_human_bytes(zip_size)} "
+                f"✅ Done! Sent {_human_bytes(txt_size)} "
                 f"({total_cred_count:,} credentials).\n"
                 f"⚡ Avg speed: {_human_speed(speed)}"
             )
         else:
-            # Too large — split by lines
+            # Too large — split into multiple .txt parts
             await _edit(
-                f"📦 Result too large ({_human_bytes(zip_size)}). "
+                f"📄 Result too large ({_human_bytes(txt_size)}). "
                 "Splitting into parts..."
             )
             lines_per_part = max(1, int(
-                len(sorted_creds) * DOC_UPLOAD_LIMIT * 0.8 / zip_size
+                len(sorted_creds) * DOC_UPLOAD_LIMIT * 0.8 / txt_size
             ))
             parts_sent = 0
             for part_start in range(0, len(sorted_creds), lines_per_part):
                 part_creds = sorted_creds[part_start:part_start + lines_per_part]
                 part_idx = part_start // lines_per_part
                 part_name = (
-                    "ulp_results.zip" if part_idx == 0
-                    else f"ulp_results_{part_idx}.zip"
+                    "ulp_results.txt" if part_idx == 0
+                    else f"ulp_results_{part_idx}.txt"
                 )
                 part_content = "\n".join(part_creds) + "\n"
                 part_path = output_dir / part_name
-                with zipfile.ZipFile(
-                    part_path, "w", compression=zipfile.ZIP_STORED,
-                ) as z:
-                    z.writestr("credentials.txt", part_content.encode("utf-8"))
+                part_path.write_text(part_content, encoding="utf-8")
                 part_size = part_path.stat().st_size
                 if part_size > DOC_UPLOAD_LIMIT:
                     continue
@@ -655,7 +653,7 @@ async def _send_ulp_results(
                 parts_sent += 1
 
             await _edit(
-                f"✅ Done! Sent {parts_sent} zip part(s) "
+                f"✅ Done! Sent {parts_sent} txt file(s) "
                 f"({total_cred_count:,} credentials).\n"
                 f"⚡ Avg speed: {_human_speed(speed)}"
             )

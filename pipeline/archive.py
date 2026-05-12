@@ -241,20 +241,54 @@ def _run_extractor(
     """Run an extractor command, capturing only stderr (for error detection).
 
     Stdout is discarded (it's per-file progress which can be huge for
-    large archives).  Only the last 8 KB of stderr is kept for
-    password/error detection.
+    large archives).  Stderr is streamed and only the last 16 KB is
+    kept for password/error detection — this prevents unbounded memory
+    growth on very large archives.
     """
-    proc = subprocess.run(
+    import io
+    import threading
+
+    proc = subprocess.Popen(
         cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-        timeout=timeout, check=False, stdin=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
     )
-    # Keep only tail of stderr (error messages are at the end)
-    stderr_raw = proc.stderr[-8192:] if proc.stderr else b""
+
+    # Stream stderr in a thread, keep only the tail
+    stderr_tail = io.BytesIO()
+    _TAIL_SIZE = 16384
+
+    def _drain_stderr() -> None:
+        assert proc.stderr is not None
+        while True:
+            chunk = proc.stderr.read(8192)
+            if not chunk:
+                break
+            # Keep a rolling tail buffer
+            stderr_tail.write(chunk)
+            if stderr_tail.tell() > _TAIL_SIZE * 2:
+                data = stderr_tail.getvalue()[-_TAIL_SIZE:]
+                stderr_tail.seek(0)
+                stderr_tail.truncate()
+                stderr_tail.write(data)
+
+    reader = threading.Thread(target=_drain_stderr, daemon=True)
+    reader.start()
+
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        reader.join(timeout=5)
+        raise
+
+    reader.join(timeout=10)
+
+    tail_bytes = stderr_tail.getvalue()[-_TAIL_SIZE:]
     return subprocess.CompletedProcess(
-        args=proc.args,
+        args=cmd,
         returncode=proc.returncode,
         stdout="",
-        stderr=stderr_raw.decode("utf-8", errors="replace"),
+        stderr=tail_bytes.decode("utf-8", errors="replace"),
     )
 
 

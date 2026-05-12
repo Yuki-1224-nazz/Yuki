@@ -36,8 +36,8 @@ DEFAULT_TIMEOUT = (15, 600)  # (connect, read) — faster connect timeout
 DEFAULT_USER_AGENT = (
     "logs-to-cookie/2.1 (+https://github.com/Yuki-1224-nazz/Yuki)"
 )
-MAX_RETRIES = 3
-RETRY_BACKOFF_BASE = 1.5  # seconds
+MAX_RETRIES = 5
+RETRY_BACKOFF_BASE = 2.0  # seconds
 DEFAULT_CONNECTIONS = int(os.getenv("DOWNLOAD_CONNECTIONS", "32"))
 MIN_SEGMENT_SIZE = 2 * 1024 * 1024  # 2 MB — no point splitting smaller
 
@@ -72,7 +72,7 @@ def _make_connector(num_connections: int) -> aiohttp.TCPConnector:
 
 
 def _make_timeout() -> aiohttp.ClientTimeout:
-    return aiohttp.ClientTimeout(total=None, connect=15, sock_read=120)
+    return aiohttp.ClientTimeout(total=None, connect=30, sock_read=600)
 
 
 _COMMON_HEADERS = {
@@ -81,6 +81,20 @@ _COMMON_HEADERS = {
     "Accept-Encoding": "identity",
     "Connection": "keep-alive",
 }
+
+
+def _check_disk_space(path: Path, required: int) -> None:
+    """Raise DownloadError if there isn't enough disk space."""
+    try:
+        st = os.statvfs(str(path))
+        free = st.f_bavail * st.f_frsize
+        if free < required:
+            raise DownloadError(
+                f"not enough disk space: {free / (1024**3):.1f} GB free, "
+                f"need ~{required / (1024**3):.1f} GB"
+            )
+    except OSError:
+        pass  # can't check — proceed and let the write fail naturally
 
 
 async def _download_segment(
@@ -113,11 +127,17 @@ async def _download_segment(
                     raise _RangeNotSupported(
                         f"HTTP {resp.status} for segment {segment_id}"
                     )
-                with open(seg_path, "wb", buffering=1024 * 1024) as f:
+                with open(seg_path, "wb", buffering=2 * 1024 * 1024) as f:
                     async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
                         if not chunk:
                             continue
-                        f.write(chunk)
+                        try:
+                            f.write(chunk)
+                        except OSError as disk_err:
+                            raise DownloadError(
+                                f"disk write failed for segment "
+                                f"{segment_id}: {disk_err}"
+                            ) from disk_err
                         written += len(chunk)
                         async with progress_lock:
                             progress[segment_id] = written
@@ -128,7 +148,13 @@ async def _download_segment(
             raise
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
             if attempt < MAX_RETRIES:
-                await asyncio.sleep(RETRY_BACKOFF_BASE ** attempt)
+                wait = min(RETRY_BACKOFF_BASE ** attempt, 30)
+                log.warning(
+                    "segment %d attempt %d/%d failed (%s), "
+                    "retrying in %.1fs...",
+                    segment_id, attempt, MAX_RETRIES, exc, wait,
+                )
+                await asyncio.sleep(wait)
             else:
                 raise DownloadError(
                     f"segment {segment_id} failed after {MAX_RETRIES} "
@@ -183,6 +209,10 @@ async def _multi_conn_download(
         raise DownloadError(
             f"file is {total_size} bytes, larger than max ({max_bytes})"
         )
+
+    # Need ~1.5x file size: segments + final assembled file (segments
+    # are deleted as they are assembled, but briefly overlap)
+    _check_disk_space(dest.parent, int(total_size * 1.5))
 
     seg_size = total_size // num_connections
     if seg_size < MIN_SEGMENT_SIZE:
@@ -259,11 +289,16 @@ async def _stream_response(
     """Read an already-opened response to disk. Used by single-conn path."""
     written = 0
     last_emit = 0.0
-    with open(dest, "wb", buffering=2 * 1024 * 1024) as f:
+    with open(dest, "wb", buffering=4 * 1024 * 1024) as f:
         async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
             if not chunk:
                 continue
-            f.write(chunk)
+            try:
+                f.write(chunk)
+            except OSError as disk_err:
+                raise DownloadError(
+                    f"disk write failed: {disk_err}"
+                ) from disk_err
             written += len(chunk)
             if max_bytes is not None and written > max_bytes:
                 raise DownloadError(

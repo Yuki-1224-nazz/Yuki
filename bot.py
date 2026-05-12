@@ -1512,6 +1512,52 @@ async def _run_job(
                 cookie_count=total_cookie_count, bytes_read=total_bytes_read,
                 elapsed=elapsed, status=job_status,
             ))
+    except MemoryError:
+        log.error("OOM during job for user %s", user_id)
+        try:
+            await _edit(
+                "❌ Out of memory — the file is too large for this "
+                "server. Try a smaller archive or add keyword filters "
+                "to reduce the result size."
+            )
+        except Exception:
+            pass
+        _job_history.append(JobRecord(
+            user_id=user_id, username=username, urls=urls,
+            cookie_count=0, bytes_read=0,
+            elapsed=int(time.time() - started), status="failed",
+        ))
+    except OSError as exc:
+        log.error("OS error during job for user %s: %s", user_id, exc)
+        msg = str(exc)
+        if "No space left" in msg or "ENOSPC" in msg:
+            detail = (
+                "❌ Disk full — the server ran out of storage while "
+                "processing your file. The archive may be too large "
+                "for this server's disk."
+            )
+        else:
+            detail = f"❌ System error: {msg}"
+        try:
+            await _edit(detail)
+        except Exception:
+            pass
+        _job_history.append(JobRecord(
+            user_id=user_id, username=username, urls=urls,
+            cookie_count=0, bytes_read=0,
+            elapsed=int(time.time() - started), status="failed",
+        ))
+    except Exception as exc:
+        log.exception("unexpected error during job for user %s", user_id)
+        try:
+            await _edit(f"❌ Unexpected error: {exc}")
+        except Exception:
+            pass
+        _job_history.append(JobRecord(
+            user_id=user_id, username=username, urls=urls,
+            cookie_count=0, bytes_read=0,
+            elapsed=int(time.time() - started), status="failed",
+        ))
     finally:
         _active_jobs.pop(user_id, None)
         context.user_data.clear()

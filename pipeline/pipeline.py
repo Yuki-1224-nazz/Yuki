@@ -493,14 +493,35 @@ async def async_run_pipeline(
 
     if kind is not None:
         dl_size_mb = download_path.stat().st_size / (1024 * 1024)
-        status(
-            f"⚙ Extracting {kind} archive ({dl_size_mb:.0f} MB)... "
-            "this may take a few minutes for large files"
-        )
+        dl_size_gb = dl_size_mb / 1024
+        if dl_size_gb >= 1:
+            status(
+                f"⚙ Extracting {kind} archive ({dl_size_gb:.1f} GB)... "
+                "this may take a while for large files"
+            )
+        else:
+            status(
+                f"⚙ Extracting {kind} archive ({dl_size_mb:.0f} MB)... "
+                "this may take a few minutes for large files"
+            )
         extracted = workdir / "extracted"
 
-        # Scale timeout with archive size (min 600s, +120s per GB, no cap)
-        extraction_timeout = max(600, int(600 + (dl_size_mb / 1024) * 120))
+        # Scale timeout with archive size (min 600s, +300s per GB, no cap)
+        extraction_timeout = max(600, int(600 + dl_size_gb * 300))
+
+        # Check disk space: extraction can expand 2-5x the archive size
+        try:
+            import os as _os
+            st = _os.statvfs(str(workdir))
+            free_bytes = st.f_bavail * st.f_frsize
+            needed = int(download_path.stat().st_size * 3)
+            if free_bytes < needed:
+                status(
+                    f"⚠️ Low disk space: {free_bytes / (1024**3):.1f} GB free, "
+                    f"may need ~{needed / (1024**3):.1f} GB for extraction"
+                )
+        except OSError:
+            pass
 
         loop = asyncio.get_running_loop()
         extract_start = _time.time()

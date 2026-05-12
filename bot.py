@@ -306,8 +306,9 @@ async def on_mode_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.edit_message_text(
             "🔑 *Logs to ULP* mode selected.\n\n"
             "Send me one or more *direct download URLs* to your logs "
-            "(comma or space separated). I'll extract all `user:pass` "
-            "credentials from the archive.",
+            "(comma or space separated), *or upload a .txt file* "
+            "with credentials. If lines are `url:user:pass`, the URL "
+            "will be stripped automatically → `user:pass`.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=_EXIT_KB,
         )
@@ -352,7 +353,9 @@ async def on_mode_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         await update.message.reply_text(
             "🔑 *Logs to ULP* mode selected.\n\n"
             "Send me one or more *direct download URLs* to your logs "
-            "(comma or space separated).\n\n"
+            "(comma or space separated), *or upload a .txt file* "
+            "with credentials. If lines are `url:user:pass`, the URL "
+            "will be stripped automatically → `user:pass`.\n\n"
             "At any time you can send /cancel to abort.",
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -478,16 +481,18 @@ async def on_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def on_document_upload(
     update: Update, context: ContextTypes.DEFAULT_TYPE,
 ) -> int:
-    """Handle .txt file upload in ULP (URL) mode.
+    """Handle .txt file upload in ULP modes.
 
     Downloads the file, stores its path, and skips straight to keywords.
+    Mode 2 (ulp): strips URLs from url:user:pass → user:pass
+    Mode 3 (ulp_url): keeps full url:user:pass
     """
     mode = context.user_data.get("mode", "cookie")
     doc = update.message.document
 
-    if mode != "ulp_url" or doc is None:
+    if mode not in ("ulp", "ulp_url") or doc is None:
         await update.message.reply_text(
-            "File uploads are only supported in *ULP (URL)* mode.\n"
+            "File uploads are only supported in *ULP* modes.\n"
             "Please send a download URL instead, or /cancel.",
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -496,8 +501,8 @@ async def on_document_upload(
     fname = (doc.file_name or "").lower()
     if not fname.endswith(".txt"):
         await update.message.reply_text(
-            "Please upload a `.txt` file containing `url:user:pass` "
-            "lines, or send a download URL instead.",
+            "Please upload a `.txt` file with credentials, "
+            "or send a download URL instead.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return ASK_URL
@@ -613,15 +618,50 @@ async def on_keywords(
 
 
 # ---------------------------------------------------------------------------
-# Uploaded .txt file processing (ULP URL mode)
+# Uploaded .txt file processing (ULP modes)
 # ---------------------------------------------------------------------------
+
+# Regex to detect lines in url:user:pass format.
+# Matches: http(s)://...:user:pass  OR  domain.tld/...:user:pass
+_URL_USER_PASS_RE = re.compile(
+    r"^(https?://\S+?)"   # URL starting with http(s)://
+    r":([^:]+)"            # :user
+    r":(.+)$"              # :pass
+)
+_DOMAIN_USER_PASS_RE = re.compile(
+    r"^([a-zA-Z0-9][-a-zA-Z0-9]*\.[a-zA-Z]{2,}\S*?)"  # domain.tld/...
+    r":([^:]+)"            # :user
+    r":(.+)$"              # :pass
+)
+
+
+def _strip_url_from_line(line: str) -> str:
+    """Strip the URL prefix from a url:user:pass line → user:pass.
+
+    If the line doesn't match url:user:pass format, returns it as-is.
+    """
+    m = _URL_USER_PASS_RE.match(line)
+    if m:
+        return f"{m.group(2)}:{m.group(3)}"
+    m = _DOMAIN_USER_PASS_RE.match(line)
+    if m:
+        return f"{m.group(2)}:{m.group(3)}"
+    return line
+
+
 async def _process_uploaded_ulp_file(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     keywords: list[str],
 ) -> None:
-    """Process an uploaded .txt file with url:user:pass lines."""
+    """Process an uploaded .txt file with credentials.
+
+    Mode 2 (ulp): strips URLs from url:user:pass → user:pass
+    Mode 3 (ulp_url): keeps full url:user:pass
+    """
     uploaded_path = Path(context.user_data["uploaded_file"])
+    mode = context.user_data.get("mode", "ulp_url")
+    strip_url = mode == "ulp"
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
     username = update.effective_user.username or str(user_id)
@@ -661,18 +701,28 @@ async def _process_uploaded_ulp_file(
 
     matched: list[str] = []
     seen: set[str] = set()
+    urls_stripped = 0
     for line in lines:
         stripped = line.strip()
         if not stripped:
             continue
-        if stripped in seen:
-            continue
+        # Keyword filtering matches against the ORIGINAL line
+        # (including URL) so keywords can match domain names
         if kw_lowers:
             low = stripped.lower()
             if not any(kw in low for kw in kw_lowers):
                 continue
-        seen.add(stripped)
-        matched.append(stripped)
+        # Smart URL stripping for mode 2
+        if strip_url:
+            output_line = _strip_url_from_line(stripped)
+            if output_line != stripped:
+                urls_stripped += 1
+        else:
+            output_line = stripped
+        if output_line in seen:
+            continue
+        seen.add(output_line)
+        matched.append(output_line)
 
     elapsed = int(time.time() - started)
     total_cred_count = len(matched)
@@ -694,6 +744,10 @@ async def _process_uploaded_ulp_file(
 
     output_dir = uploaded_path.parent / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    fmt_label = "user:pass" if strip_url else "url:user:pass"
+    base_name = "ulp_results" if strip_url else "ulp_url_results"
+    strip_note = f"\n🔗 URLs stripped from {urls_stripped:,} lines" if urls_stripped > 0 else ""
 
     if len(keywords) > 1:
         # Per-keyword .txt files
@@ -721,7 +775,7 @@ async def _process_uploaded_ulp_file(
             )
         await _edit(
             f"✅ Done! {grand_count:,} credentials "
-            f"across {len(keywords)} keywords.\n"
+            f"across {len(keywords)} keywords.{strip_note}\n"
             f"📄 Scanned {total_lines:,} lines\n"
             f"⏱️ {elapsed}s"
         )
@@ -730,14 +784,14 @@ async def _process_uploaded_ulp_file(
         sorted_creds = sorted(matched)
         await _send_txt_parts(
             context, chat_id, sorted_creds, output_dir,
-            base_name="ulp_url_results",
+            base_name=base_name,
             caption_prefix="🔑",
             _edit=_edit,
-            fmt_label="url:user:pass",
+            fmt_label=fmt_label,
         )
         await _edit(
             f"✅ Done! {total_cred_count:,} credentials "
-            f"(url:user:pass, deduplicated).\n"
+            f"({fmt_label}, deduplicated).{strip_note}\n"
             f"📄 Scanned {total_lines:,} lines\n"
             f"⏱️ {elapsed}s"
         )

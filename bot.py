@@ -46,10 +46,11 @@ from typing import Callable, Optional, Sequence
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
-from telegram import BotCommand, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     ConversationHandler,
@@ -258,20 +259,61 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
 
     context.user_data.clear()
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🍪 Logs to Cookie", callback_data="mode_cookie"),
+            InlineKeyboardButton("🔑 Logs to ULP", callback_data="mode_ulp"),
+        ],
+        [InlineKeyboardButton("❌ Exit", callback_data="mode_exit")],
+    ])
     text = (
         "👋 *logs-to-cookie & logs-to-ulp*\n\n"
-        "Select a mode:\n\n"
-        "1️⃣  *Logs to Cookie* — Extract Netscape cookies\n"
-        "2️⃣  *Logs to ULP* — Extract credentials (user:pass)\n"
-        "0️⃣  *Exit*\n\n"
-        "Send `1`, `2`, or `0` to choose."
+        "Select a mode:"
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(
+        text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard,
+    )
     return ASK_MODE
 
 
-async def on_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Phase 0b — MODE SELECTION. User picks cookie or ULP mode."""
+async def on_mode_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle inline button press for mode selection."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "mode_exit":
+        await query.edit_message_text("👋 Exited. Send /start to begin again.")
+        context.user_data.clear()
+        return ConversationHandler.END
+    elif data == "mode_cookie":
+        context.user_data["mode"] = "cookie"
+        await query.edit_message_text(
+            "🍪 *Logs to Cookie* mode selected.\n\n"
+            "Send me one or more *direct download URLs* to your logs "
+            "(comma or space separated). I accept any `http(s)` link "
+            "— zip, 7z, rar, tokenised CDN paths, or `gofile.io` "
+            "links.\n\n"
+            "At any time you can send /cancel to abort.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return ASK_URL
+    elif data == "mode_ulp":
+        context.user_data["mode"] = "ulp"
+        await query.edit_message_text(
+            "🔑 *Logs to ULP* mode selected.\n\n"
+            "Send me one or more *direct download URLs* to your logs "
+            "(comma or space separated). I'll extract all `user:pass` "
+            "credentials from the archive.\n\n"
+            "At any time you can send /cancel to abort.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return ASK_URL
+    return ASK_MODE
+
+
+async def on_mode_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Fallback: handle typed text during mode selection."""
     text = (update.message.text or "").strip()
     if text.startswith("/"):
         return await cmd_cancel(update, context)
@@ -285,9 +327,7 @@ async def on_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text(
             "🍪 *Logs to Cookie* mode selected.\n\n"
             "Send me one or more *direct download URLs* to your logs "
-            "(comma or space separated). I accept any `http(s)` link "
-            "— zip, 7z, rar, tokenised CDN paths, or `gofile.io` "
-            "links.\n\n"
+            "(comma or space separated).\n\n"
             "At any time you can send /cancel to abort.",
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -297,15 +337,14 @@ async def on_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text(
             "🔑 *Logs to ULP* mode selected.\n\n"
             "Send me one or more *direct download URLs* to your logs "
-            "(comma or space separated). I'll extract all `user:pass` "
-            "credentials from the archive.\n\n"
+            "(comma or space separated).\n\n"
             "At any time you can send /cancel to abort.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return ASK_URL
     else:
         await update.message.reply_text(
-            "Please send `1` for Cookie, `2` for ULP, or `0` to exit.",
+            "Please tap a button above, or send `1`, `2`, or `0`.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return ASK_MODE
@@ -1452,8 +1491,9 @@ def build_app() -> Application:
         ],
         states={
             ASK_MODE: [
+                CallbackQueryHandler(on_mode_button, pattern="^mode_"),
                 CommandHandler("cancel", cmd_cancel),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, on_mode),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, on_mode_text),
             ],
             ASK_URL: [
                 CommandHandler("cancel", cmd_cancel),

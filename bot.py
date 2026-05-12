@@ -28,21 +28,29 @@ Performance improvements in v2.1:
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
+import glob
 import os
+import platform
+import psutil  # type: ignore[import-untyped]
+import re
 import shutil
 import tempfile
 import time
 import zipfile
+from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     ConversationHandler,
@@ -51,7 +59,8 @@ from telegram.ext import (
 )
 
 from pipeline import async_run_pipeline
-from pipeline.archive import SEVENZIP_BINARIES
+from pipeline.archive import SEVENZIP_BINARIES, _ensure_unrar
+from pipeline.cookies import parse_cookie_line
 
 load_dotenv()
 
@@ -61,17 +70,70 @@ logging.basicConfig(
 )
 log = logging.getLogger("logs-to-cookie.bot")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8661120242:AAEO3UUHVKrcQha_XCGsVA0tJJq3qy5_8YQ").strip()
+
+# ---------------------------------------------------------------------------
+# In-memory ring buffer for recent WARNING+ log messages
+# ---------------------------------------------------------------------------
+class _RingHandler(logging.Handler):
+    """Keep the last *maxlen* WARNING+ records in memory."""
+
+    def __init__(self, maxlen: int = 30) -> None:
+        super().__init__(level=logging.WARNING)
+        self.records: deque[str] = deque(maxlen=maxlen)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.records.append(self.format(record))
+        except Exception:
+            pass
+
+
+_ring_handler = _RingHandler(maxlen=30)
+_ring_handler.setFormatter(
+    logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
+)
+logging.getLogger().addHandler(_ring_handler)
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8737930830:AAGXlk6NJlH11N0TLOsd7ATuT2Pqo0jl5X8").strip()
 DOC_UPLOAD_LIMIT = int(os.getenv("DOC_UPLOAD_LIMIT", str(50 * 1024 * 1024)))
 MAX_DOWNLOAD_BYTES = int(
-    os.getenv("MAX_DOWNLOAD_BYTES", str(5 * 1024 * 1024 * 1024))
+    os.getenv("MAX_DOWNLOAD_BYTES", str(1024 * 1024 * 1024 * 1024))  # 1 TB
 )
-DOWNLOAD_CONNECTIONS = int(os.getenv("DOWNLOAD_CONNECTIONS", "16"))
+DOWNLOAD_CONNECTIONS = int(os.getenv("DOWNLOAD_CONNECTIONS", "32"))
+
+BOT_VERSION = "3.0.0"
+_BOOT_TIME = time.time()
+
+
+# ---------------------------------------------------------------------------
+# Job history tracking
+# ---------------------------------------------------------------------------
+@dataclass
+class JobRecord:
+    """Lightweight record of a completed or failed job."""
+    user_id: int
+    username: str
+    urls: list[str]
+    cookie_count: int
+    bytes_read: int
+    elapsed: int
+    status: str  # "success" | "partial" | "failed" | "no_cookies"
+    timestamp: float = field(default_factory=time.time)
+
+
+_job_history: deque[JobRecord] = deque(maxlen=50)
+
+
+# ---------------------------------------------------------------------------
+# Per-user active job tracking
+# ---------------------------------------------------------------------------
+_active_jobs: dict[int, str] = {}  # user_id -> status description
 
 
 # ---------------------------------------------------------------------------
 # Conversation states
 # ---------------------------------------------------------------------------
+ASK_MODE = 0
 ASK_URL = 1
 ASK_PASSWORD = 2
 ASK_KEYWORDS = 3
@@ -93,7 +155,7 @@ def _parse_admins(raw: str) -> set[int]:
     return out
 
 
-ADMIN_IDS: set[int] = _parse_admins(os.getenv("ADMIN_IDS", ""))
+ADMIN_IDS: set[int] = _parse_admins(os.getenv("ADMIN_IDS", "5028065177,5376199311"))
 
 
 def _is_admin(update: Update) -> bool:
@@ -101,6 +163,14 @@ def _is_admin(update: Update) -> bool:
         return True
     user = update.effective_user
     return bool(user and user.id in ADMIN_IDS)
+
+
+async def _deny_access(update: Update) -> None:
+    """Send an access-denied reply to unauthorized users."""
+    if update.message:
+        await update.message.reply_text(
+            "\u26d4 Access denied. You are not authorized to use this bot."
+        )
 
 
 def _looks_like_url(s: str) -> bool:
@@ -183,27 +253,156 @@ def _split_keywords(text: str) -> list[str]:
 # Handlers
 # ---------------------------------------------------------------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Phase 1 — START. Greet and ask for the download URL."""
+    """Phase 0 — START. Show mode selection."""
     if not _is_admin(update):
+        await _deny_access(update)
         return ConversationHandler.END
 
     context.user_data.clear()
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🍪 Logs to Cookie", callback_data="mode_cookie"),
+            InlineKeyboardButton("🔑 Logs to ULP", callback_data="mode_ulp"),
+        ],
+        [InlineKeyboardButton("❌ Exit", callback_data="mode_exit")],
+    ])
     text = (
-        "👋 *logs-to-cookie* — Netscape cookie converter\n\n"
-        "Send me one or more *direct download URLs* to your logs "
-        "(comma or space separated). I accept any `http(s)` link "
-        "— zip, 7z, rar, tokenised CDN paths, or `gofile.io` "
-        "links. I'll download them all in parallel, extract every "
-        "Netscape cookie, and send the results back as a single "
-        "zip.\n\n"
-        "At any time you can send /cancel to abort."
+        "👋 *logs-to-cookie & logs-to-ulp*\n\n"
+        "Select a mode:"
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-    return ASK_URL
+    await update.message.reply_text(
+        text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard,
+    )
+    return ASK_MODE
+
+
+async def on_mode_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle inline button press for mode selection."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "mode_exit":
+        await query.edit_message_text("👋 Exited. Send /start to begin again.")
+        context.user_data.clear()
+        return ConversationHandler.END
+    elif data == "mode_cookie":
+        context.user_data["mode"] = "cookie"
+        await query.edit_message_text(
+            "🍪 *Logs to Cookie* mode selected.\n\n"
+            "Send me one or more *direct download URLs* to your logs "
+            "(comma or space separated). I accept any `http(s)` link "
+            "— zip, 7z, rar, tokenised CDN paths, or `gofile.io` "
+            "links.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_EXIT_KB,
+        )
+        return ASK_URL
+    elif data == "mode_ulp":
+        context.user_data["mode"] = "ulp"
+        await query.edit_message_text(
+            "🔑 *Logs to ULP* mode selected.\n\n"
+            "Send me one or more *direct download URLs* to your logs "
+            "(comma or space separated). I'll extract all `user:pass` "
+            "credentials from the archive.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_EXIT_KB,
+        )
+        return ASK_URL
+    return ASK_MODE
+
+
+async def on_mode_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Fallback: handle typed text during mode selection."""
+    text = (update.message.text or "").strip()
+    if text.startswith("/"):
+        return await cmd_cancel(update, context)
+
+    if text == "0":
+        await update.message.reply_text("👋 Exited. Send /start to begin again.")
+        context.user_data.clear()
+        return ConversationHandler.END
+    elif text == "1":
+        context.user_data["mode"] = "cookie"
+        await update.message.reply_text(
+            "🍪 *Logs to Cookie* mode selected.\n\n"
+            "Send me one or more *direct download URLs* to your logs "
+            "(comma or space separated).\n\n"
+            "At any time you can send /cancel to abort.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return ASK_URL
+    elif text == "2":
+        context.user_data["mode"] = "ulp"
+        await update.message.reply_text(
+            "🔑 *Logs to ULP* mode selected.\n\n"
+            "Send me one or more *direct download URLs* to your logs "
+            "(comma or space separated).\n\n"
+            "At any time you can send /cancel to abort.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return ASK_URL
+    else:
+        await update.message.reply_text(
+            "Please tap a button above, or send `1`, `2`, or `0`.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return ASK_MODE
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await cmd_start(update, context)
+    """Show all available commands."""
+    if not _is_admin(update):
+        await _deny_access(update)
+        return ConversationHandler.END
+
+    text = (
+        "📋 *Available Commands*\n\n"
+        "*Core:*\n"
+        "🔹 /start — Start (choose Cookie or ULP mode)\n"
+        "🔹 /help — Show this command list\n"
+        "🔹 /skip — Skip password or keywords prompt\n"
+        "🔹 /cancel — Cancel current job\n\n"
+        "*Monitoring:*\n"
+        "🔹 /status — Check active jobs (all admins)\n"
+        "🔹 /ping — Health check with latency\n"
+        "🔹 /memory — Show RAM usage\n"
+        "🔹 /disk — Show disk usage\n"
+        "🔹 /logs — Recent warnings & errors\n\n"
+        "*Configuration:*\n"
+        "🔹 /settings — View bot configuration\n"
+        "🔹 /connections — View/set parallel downloads (1–64)\n"
+        "🔹 /speed — Worker/thread config\n"
+        "🔹 /admins — Show admin list\n\n"
+        "*Utilities:*\n"
+        "🔹 /history — Last 10 completed jobs\n"
+        "🔹 /info — Bot version, uptime, stats\n"
+        "🔹 /cleanup — Clear temp files to free disk\n"
+        "\n"
+        "💡 *Tips:*\n"
+        "• Send `1` at start for Cookie mode, `2` for ULP mode\n"
+        "• ULP mode extracts user:pass credentials\n"
+        "• Send multiple links (comma/space separated)\n"
+        "• One password works for all links with same password\n"
+        "• Multiple keywords → separate zip per keyword\n"
+        "• Supports ZIP, 7z, RAR (including RAR5)\n"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    return ConversationHandler.END
+
+
+_EXIT_KB = InlineKeyboardMarkup([
+    [InlineKeyboardButton("❌ Exit", callback_data="exit_conv")],
+])
+
+
+async def _on_exit_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle the exit button pressed at any step."""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("👋 Exited. Send /start to begin again.")
+    context.user_data.clear()
+    return ConversationHandler.END
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -232,34 +431,82 @@ async def on_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["urls"] = urls
     count = len(urls)
     label = f"🔗 Got {count} link{'s' if count > 1 else ''}"
-    await update.message.reply_text(
-        f"{label}. If the archives are encrypted, send the "
-        "*password* now. Otherwise send /skip.",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    if count > 1:
+        await update.message.reply_text(
+            f"{label}. If the archives are encrypted, send the "
+            "*password(s)* now (comma-separated, one per link — "
+            "e.g. `pass1, pass2`). If all archives share the same "
+            "password, send it once. Otherwise send /skip.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    else:
+        await update.message.reply_text(
+            f"{label}. If the archive is encrypted, send the "
+            "*password* now. Otherwise send /skip.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
     return ASK_PASSWORD
+
+
+def _parse_passwords(text: str, num_urls: int) -> list[Optional[str]]:
+    """Parse comma-separated passwords and align them with URLs.
+
+    Rules:
+    - Single URL → the *entire* text is the password (no splitting).
+    - Multiple URLs with comma-separated passwords → map 1-to-1.
+    - One password for multiple URLs → reuse for all.
+    - Fewer passwords than URLs → remaining get ``None``.
+    - Only genuinely empty tokens are treated as no password.
+    """
+    # Single URL: never split — the whole text is the password.
+    if num_urls <= 1:
+        return [text] if text else [None]
+
+    raw_parts = [p.strip() for p in text.split(",")]
+    passwords: list[Optional[str]] = []
+    for p in raw_parts:
+        passwords.append(p if p else None)
+
+    if len(passwords) == 1:
+        return passwords * num_urls
+
+    # Pad with None if fewer passwords than URLs
+    while len(passwords) < num_urls:
+        passwords.append(None)
+
+    return passwords[:num_urls]
 
 
 async def on_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Phase 2b — INPUT. User just answered the password prompt."""
     text = (update.message.text or "").strip()
+    urls = context.user_data.get("urls") or []
+    num_urls = len(urls) or 1
     if text.startswith("/"):
         if text.lower().startswith("/skip"):
-            context.user_data["password"] = None
+            context.user_data["passwords"] = [None] * num_urls
         elif text.lower().startswith("/cancel"):
             return await cmd_cancel(update, context)
         else:
             return await cmd_cancel(update, context)
-    elif text.lower() in ("none", "-", "skip", ""):
-        context.user_data["password"] = None
+    elif not text:
+        context.user_data["passwords"] = [None] * num_urls
     else:
-        context.user_data["password"] = text
+        context.user_data["passwords"] = _parse_passwords(text, num_urls)
 
-    await update.message.reply_text(
-        "🔎 Send the *keywords* you want to filter cookies by "
-        "(comma-separated), or send /skip to keep every cookie.",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    mode = context.user_data.get("mode", "cookie")
+    if mode == "ulp":
+        await update.message.reply_text(
+            "🔎 Send *keywords* to filter credentials by "
+            "(comma-separated), or send /skip to keep all.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    else:
+        await update.message.reply_text(
+            "🔎 Send the *keywords* you want to filter cookies by "
+            "(comma-separated), or send /skip to keep every cookie.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
     return ASK_KEYWORDS
 
 
@@ -288,6 +535,201 @@ async def on_keywords(
 # ---------------------------------------------------------------------------
 # Phase 3-5 — PROCESS, OUTPUT, FEEDBACK
 # ---------------------------------------------------------------------------
+async def _send_ulp_results(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    user_id: int,
+    username: str,
+    urls: list[str],
+    all_credentials: set[str],
+    keywords: Sequence[str],
+    total_bytes_read: int,
+    speed: float,
+    elapsed: int,
+    errors: list[str],
+    output_dir: Path,
+    _edit: Callable,
+    *,
+    ulp_per_keyword: Optional[dict] = None,
+) -> None:
+    """Send ULP (user:pass) results as .txt files (per-keyword or single)."""
+    total_cred_count = len(all_credentials)
+
+    if len(keywords) > 1:
+        # Per-keyword .txt files — use pipeline's per-keyword data
+        _active_jobs[user_id] = "Splitting by keywords..."
+        await _edit(
+            f"🔑 Sending {total_cred_count:,} credentials "
+            f"by {len(keywords)} keywords..."
+        )
+
+        grand_cred_count = 0
+        job_status = "success" if not errors else "partial"
+
+        for kw_idx, kw in enumerate(keywords, start=1):
+            kw_lower = kw.strip().lower()
+            # Use pre-classified per-keyword data from pipeline
+            if ulp_per_keyword and kw_lower in ulp_per_keyword:
+                matched = sorted(ulp_per_keyword[kw_lower])
+            else:
+                matched = sorted(
+                    c for c in all_credentials
+                    if kw_lower in c.lower()
+                )
+            if not matched:
+                continue
+
+            grand_cred_count += len(matched)
+            content = "\n".join(matched) + "\n"
+            content_bytes = content.encode("utf-8")
+
+            safe_kw = re.sub(r"[^A-Za-z0-9_-]+", "_", kw.strip())[:40] or "results"
+            txt_name = f"{safe_kw}_Results.txt"
+            txt_path = output_dir / txt_name
+            txt_path.write_bytes(content_bytes)
+            txt_size = txt_path.stat().st_size
+
+            if txt_size > DOC_UPLOAD_LIMIT:
+                # Split into multiple .txt parts
+                lines_per_part = max(1, int(
+                    len(matched) * DOC_UPLOAD_LIMIT * 0.8 / txt_size
+                ))
+                part_num = 0
+                for ps in range(0, len(matched), lines_per_part):
+                    part_creds = matched[ps:ps + lines_per_part]
+                    part_num += 1
+                    pname = (
+                        f"{safe_kw}_Results.txt" if part_num == 1
+                        else f"{safe_kw}_Results_{part_num}.txt"
+                    )
+                    ppath = output_dir / pname
+                    ppath.write_text("\n".join(part_creds) + "\n", encoding="utf-8")
+                    psize = ppath.stat().st_size
+                    if psize > DOC_UPLOAD_LIMIT:
+                        continue
+                    with open(ppath, "rb") as f:
+                        await context.bot.send_document(
+                            chat_id=chat_id,
+                            document=f,
+                            filename=pname,
+                            caption=(
+                                f"🔑 {kw} (part {part_num}) — "
+                                f"{len(part_creds):,} credentials"
+                            ),
+                        )
+            else:
+                await _edit(
+                    f"📤 Sending {txt_name} ({kw_idx}/{len(keywords)}) "
+                    f"— {len(matched):,} credentials..."
+                )
+                with open(txt_path, "rb") as f:
+                    await context.bot.send_document(
+                        chat_id=chat_id,
+                        document=f,
+                        filename=txt_name,
+                        caption=(
+                            f"🔑 {kw} — {len(matched):,} credentials\n"
+                            f"📄 {_human_bytes(txt_size)}"
+                        ),
+                    )
+
+        await _edit(
+            f"✅ Done! {grand_cred_count:,} credentials "
+            f"across {len(keywords)} keywords.\n"
+            f"📡 Read: {_human_bytes(total_bytes_read)} "
+            f"({_human_speed(speed)})\n"
+            f"⏱️ {elapsed}s"
+        )
+        _job_history.append(JobRecord(
+            user_id=user_id, username=username, urls=urls,
+            cookie_count=grand_cred_count, bytes_read=total_bytes_read,
+            elapsed=elapsed, status=job_status,
+        ))
+    else:
+        # Single or no keyword — one .txt file
+        sorted_creds = sorted(all_credentials)
+        content = "\n".join(sorted_creds) + "\n"
+        content_bytes = content.encode("utf-8")
+
+        txt_path = output_dir / "ulp_results.txt"
+        txt_path.write_bytes(content_bytes)
+        txt_size = txt_path.stat().st_size
+
+        if txt_size <= DOC_UPLOAD_LIMIT:
+            await _edit(
+                "📤 Uploading result...\n"
+                f"🔑 {total_cred_count:,} credentials (deduplicated)\n"
+                f"📄 {_human_bytes(txt_size)}\n"
+                f"⏱️ Elapsed: {elapsed}s"
+            )
+            with open(txt_path, "rb") as f:
+                await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=f,
+                    filename=txt_path.name,
+                    caption=(
+                        f"🔑 {total_cred_count:,} credentials "
+                        f"(user:pass, deduplicated)\n"
+                        f"📡 read: {_human_bytes(total_bytes_read)} "
+                        f"({_human_speed(speed)})\n"
+                        f"⏱️ {elapsed}s"
+                    ),
+                )
+            await _edit(
+                f"✅ Done! Sent {_human_bytes(txt_size)} "
+                f"({total_cred_count:,} credentials).\n"
+                f"⚡ Avg speed: {_human_speed(speed)}"
+            )
+        else:
+            # Too large — split into multiple .txt parts
+            await _edit(
+                f"📄 Result too large ({_human_bytes(txt_size)}). "
+                "Splitting into parts..."
+            )
+            lines_per_part = max(1, int(
+                len(sorted_creds) * DOC_UPLOAD_LIMIT * 0.8 / txt_size
+            ))
+            parts_sent = 0
+            for part_start in range(0, len(sorted_creds), lines_per_part):
+                part_creds = sorted_creds[part_start:part_start + lines_per_part]
+                part_idx = part_start // lines_per_part
+                part_name = (
+                    "ulp_results.txt" if part_idx == 0
+                    else f"ulp_results_{part_idx}.txt"
+                )
+                part_content = "\n".join(part_creds) + "\n"
+                part_path = output_dir / part_name
+                part_path.write_text(part_content, encoding="utf-8")
+                part_size = part_path.stat().st_size
+                if part_size > DOC_UPLOAD_LIMIT:
+                    continue
+                with open(part_path, "rb") as f:
+                    await context.bot.send_document(
+                        chat_id=chat_id,
+                        document=f,
+                        filename=part_name,
+                        caption=(
+                            f"🔑 Part {part_idx + 1} — "
+                            f"{len(part_creds):,} credentials, "
+                            f"{_human_bytes(part_size)}"
+                        ),
+                    )
+                parts_sent += 1
+
+            await _edit(
+                f"✅ Done! Sent {parts_sent} txt file(s) "
+                f"({total_cred_count:,} credentials).\n"
+                f"⚡ Avg speed: {_human_speed(speed)}"
+            )
+
+        job_status = "success" if not errors else "partial"
+        _job_history.append(JobRecord(
+            user_id=user_id, username=username, urls=urls,
+            cookie_count=total_cred_count, bytes_read=total_bytes_read,
+            elapsed=elapsed, status=job_status,
+        ))
+
+
 async def _run_job(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -297,11 +739,24 @@ async def _run_job(
         url_single = context.user_data.get("url", "")
         if url_single:
             urls = [url_single]
-    password: Optional[str] = context.user_data.get("password")
+    passwords: list[Optional[str]] = context.user_data.get("passwords") or []
+    # Backward compat: old-style single "password" key
+    if not passwords:
+        legacy = context.user_data.get("password")
+        passwords = [legacy] * len(urls)
+    # Ensure passwords list matches urls length
+    while len(passwords) < len(urls):
+        passwords.append(None)
+    passwords = passwords[: len(urls)]
     keywords: Sequence[str] = context.user_data.get("keywords") or []
+    mode: str = context.user_data.get("mode", "cookie")
     chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    username = update.effective_user.username or str(user_id)
     started = time.time()
     num_urls = len(urls)
+
+    _active_jobs[user_id] = f"Downloading {num_urls} link{'s' if num_urls > 1 else ''}..."
 
     status_msg = await context.bot.send_message(
         chat_id=chat_id,
@@ -354,31 +809,45 @@ async def _run_job(
     workdir = Path(tempfile.mkdtemp(prefix="logs2cookie-"))
     try:
         # Run all URLs concurrently
-        async def _run_one(idx: int, url: str) -> Optional[object]:
+        # Cookie mode: multiple keywords → no pipeline filter, classify later
+        # ULP mode: ALWAYS pass keywords to pipeline so keyword matching
+        #           uses the full URL context (not just user:pass output)
+        if mode == "ulp":
+            pipeline_keywords = keywords
+        else:
+            pipeline_keywords = keywords if len(keywords) <= 1 else []
+
+        async def _run_one(idx: int, url: str, pwd: Optional[str]) -> Optional[object]:
             sub_workdir = workdir / f"job_{idx}"
             try:
                 return await async_run_pipeline(
                     url,
                     sub_workdir,
-                    password=password,
-                    keywords=keywords,
+                    password=pwd,
+                    keywords=pipeline_keywords,
                     max_bytes=MAX_DOWNLOAD_BYTES,
                     on_status=_make_status_cb(idx),
                     on_progress=_make_progress_cb(idx),
                     num_connections=DOWNLOAD_CONNECTIONS,
+                    skip_zip=True,
+                    mode=mode,
                 )
             except Exception as exc:
                 log.exception("pipeline failed for %s", url)
                 return exc
 
-        tasks = [_run_one(i, u) for i, u in enumerate(urls)]
+        tasks = [_run_one(i, u, passwords[i]) for i, u in enumerate(urls)]
         raw_results = await asyncio.gather(*tasks)
+
+        _active_jobs[user_id] = "Processing results..."
 
         # Merge results
         from pipeline.pipeline import PipelineResult
         total_bytes_read = 0
         all_cookie_files: list[Path] = []
         total_cookie_count = 0
+        all_ulp_credentials: set[str] = set()
+        all_ulp_per_keyword: dict[str, set[str]] = {}
         errors: list[str] = []
         output_dir = workdir / "merged_output"
         cookies_dir = output_dir / "cookies"
@@ -391,18 +860,35 @@ async def _run_job(
             if not isinstance(res, PipelineResult):
                 continue
             total_bytes_read += res.bytes_read
-            total_cookie_count += res.cookie_count
-            for src_file in res.cookie_files:
-                dst = cookies_dir / f"link{idx + 1}_{src_file.name}"
-                shutil.copy2(src_file, dst)
-                all_cookie_files.append(dst)
+            if mode == "ulp":
+                all_ulp_credentials.update(res.ulp_credentials)
+                for kw, creds_set in res.ulp_per_keyword.items():
+                    if kw not in all_ulp_per_keyword:
+                        all_ulp_per_keyword[kw] = set()
+                    all_ulp_per_keyword[kw].update(creds_set)
+            else:
+                total_cookie_count += res.cookie_count
+                for src_file in res.cookie_files:
+                    dst = cookies_dir / f"link{idx + 1}_{src_file.name}"
+                    shutil.copy2(src_file, dst)
+                    all_cookie_files.append(dst)
 
         elapsed = int(time.time() - started)
         speed = total_bytes_read / (time.time() - started) if (time.time() - started) > 0 else 0
 
-        if errors and not all_cookie_files:
+        has_results = (
+            len(all_ulp_credentials) > 0 if mode == "ulp"
+            else len(all_cookie_files) > 0
+        )
+
+        if errors and not has_results:
             error_text = "\n".join(errors)
             await _edit(f"❌ All downloads failed:\n{error_text}")
+            _job_history.append(JobRecord(
+                user_id=user_id, username=username, urls=urls,
+                cookie_count=0, bytes_read=0,
+                elapsed=int(time.time() - started), status="failed",
+            ))
             return
 
         if errors:
@@ -413,66 +899,608 @@ async def _run_job(
                 loop,
             )
 
-        if total_cookie_count == 0:
+        if not has_results:
+            no_result_msg = (
+                "ℹ️ Done — no credentials found."
+                if mode == "ulp"
+                else "ℹ️ Done — no matching cookies found."
+            )
             await _edit(
-                "ℹ️ Done — no matching cookies found.\n"
+                f"{no_result_msg}\n"
                 f"📡 Read: {_human_bytes(total_bytes_read)} "
                 f"({_human_speed(speed)})\n"
                 f"⏱️ Elapsed: {elapsed}s"
             )
+            _job_history.append(JobRecord(
+                user_id=user_id, username=username, urls=urls,
+                cookie_count=0, bytes_read=total_bytes_read,
+                elapsed=elapsed,
+                status="no_credentials" if mode == "ulp" else "no_cookies",
+            ))
             return
 
-        # Zip merged results
-        zip_path = output_dir / "cookies_result.zip"
-        with zipfile.ZipFile(
-            zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1,
-        ) as z:
-            for p in all_cookie_files:
-                z.write(p, arcname=p.relative_to(output_dir).as_posix())
+        # === ULP MODE OUTPUT ===
+        if mode == "ulp":
+            await _send_ulp_results(
+                context, chat_id, user_id, username, urls,
+                all_ulp_credentials, keywords, total_bytes_read,
+                speed, elapsed, errors, output_dir, _edit,
+                ulp_per_keyword=all_ulp_per_keyword,
+            )
+            return
 
-        zip_size = zip_path.stat().st_size
+        # --- Per-keyword zip splitting (multiple keywords) ---
+        if len(keywords) > 1:
+            from concurrent.futures import ThreadPoolExecutor
 
-        if zip_size > DOC_UPLOAD_LIMIT:
+            _COOKIE_HEADER = (
+                "# Netscape HTTP Cookie File\n"
+                "# https://curl.se/docs/http-cookies.html\n"
+                "# This is a generated file. Do not edit.\n\n"
+            )
+
+            _active_jobs[user_id] = "Splitting by keywords..."
             await _edit(
-                f"❌ Result zip is too large for Telegram "
-                f"({_human_bytes(zip_size)} > "
-                f"{_human_bytes(DOC_UPLOAD_LIMIT)}).\n"
-                f"📦 {len(all_cookie_files)} cookie set(s) — "
-                f"{total_cookie_count} cookies\n"
-                "Tip: re-run with a stricter keyword filter to shrink "
-                "the result."
+                f"🔄 Classifying {len(all_cookie_files):,} files "
+                f"by {len(keywords)} keywords..."
             )
-            return
 
-        await _edit(
-            "📤 Uploading result...\n"
-            f"📦 {len(all_cookie_files)} cookie set(s) — "
-            f"{total_cookie_count} cookies\n"
-            f"📡 zip: {_human_bytes(zip_size)}\n"
-            f"⏱️ Elapsed: {elapsed}s"
-        )
-        with open(zip_path, "rb") as f:
-            await context.bot.send_document(
-                chat_id=chat_id,
-                document=f,
-                filename=zip_path.name,
-                caption=(
-                    f"✅ {len(all_cookie_files)} cookie set(s) — "
-                    f"{total_cookie_count} cookies\n"
-                    f"📡 read: {_human_bytes(total_bytes_read)} "
-                    f"({_human_speed(speed)})\n"
-                    f"⏱️ {elapsed}s"
-                ),
+            # Precompute lowercase keywords once
+            kw_lower = [(kw, kw.strip().lower()) for kw in keywords]
+
+            def _classify_one(
+                item: tuple[int, Path],
+            ) -> tuple[int, str, dict[str, str]]:
+                """Read one cookie file, return per-keyword content
+                as ready-to-zip strings (no intermediate files)."""
+                idx, src_path = item
+                sp = str(src_path)
+                try:
+                    sz = os.path.getsize(sp)
+                    if sz == 0 or sz > 512 * 1024:
+                        return idx, src_path.name, {}
+                    fd = os.open(sp, os.O_RDONLY)
+                    try:
+                        raw = os.read(fd, 512 * 1024)
+                    finally:
+                        os.close(fd)
+                except OSError:
+                    return idx, src_path.name, {}
+                text = raw.decode("utf-8", errors="replace")
+                per_kw: dict[str, list] = {}
+                for line in text.splitlines():
+                    row = parse_cookie_line(line)
+                    if row is None:
+                        continue
+                    low = line.lower()
+                    for kw, kw_lo in kw_lower:
+                        if kw_lo in low:
+                            per_kw.setdefault(kw, []).append(row)
+                # Convert rows to content strings immediately
+                per_kw_content: dict[str, str] = {}
+                for kw, rows in per_kw.items():
+                    lines = [_COOKIE_HEADER]
+                    for r in rows:
+                        lines.append(r.to_line())
+                        lines.append("\n")
+                    per_kw_content[kw] = "".join(lines)
+                return idx, src_path.name, per_kw_content
+
+            loop = asyncio.get_running_loop()
+            workers = min(500, max(8, len(all_cookie_files) // 10))
+            classify_start = time.time()
+            n_files = len(all_cookie_files)
+
+            items = [
+                (i + 1, all_cookie_files[i])
+                for i in range(n_files)
+            ]
+            all_classified: list[tuple[int, str, dict[str, str]]] = []
+            done = 0
+            last_edit = time.time()
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futs = [
+                    loop.run_in_executor(pool, _classify_one, it)
+                    for it in items
+                ]
+                for coro in asyncio.as_completed(futs):
+                    r = await coro
+                    all_classified.append(r)
+                    done += 1
+                    now = time.time()
+                    if now - last_edit >= 2:
+                        last_edit = now
+                        await _edit(
+                            f"🔄 Classifying... "
+                            f"{done:,}/{n_files:,} files "
+                            f"({now - classify_start:.0f}s)"
+                        )
+
+            # Build per-keyword zips DIRECTLY in memory (no disk I/O)
+            sent_count = 0
+            grand_cookie_count = 0
+            for kw_idx, kw in enumerate(keywords, start=1):
+                # Collect matching entries for this keyword
+                kw_entries: list[tuple[str, str]] = []  # (arcname, content)
+                kw_count = 0
+                for idx, name, per_kw_content in all_classified:
+                    content = per_kw_content.get(kw)
+                    if not content:
+                        continue
+                    arcname = f"cookies/{idx:04d}_{name}"
+                    kw_entries.append((arcname, content))
+                    kw_count += content.count("\t") // 6  # fast row count
+                if not kw_entries:
+                    continue
+                grand_cookie_count += kw_count
+                await _edit(
+                    f"📤 Sending {kw}_Cookies.zip "
+                    f"({kw_idx}/{len(keywords)}) — "
+                    f"{len(kw_entries)} sets, {kw_count:,} cookies..."
+                )
+
+                # Build zip in memory — no disk writes
+                zip_buf = io.BytesIO()
+                with zipfile.ZipFile(
+                    zip_buf, "w", compression=zipfile.ZIP_STORED,
+                ) as z:
+                    for arcname, content in kw_entries:
+                        z.writestr(arcname, content)
+                zip_size = zip_buf.tell()
+
+                if zip_size <= DOC_UPLOAD_LIMIT:
+                    zip_buf.seek(0)
+                    await context.bot.send_document(
+                        chat_id=chat_id,
+                        document=zip_buf,
+                        filename=f"{kw}_Cookies.zip",
+                        caption=(
+                            f"🔑 {kw} — {len(kw_entries)} set(s), "
+                            f"{kw_count:,} cookies"
+                        ),
+                    )
+                    sent_count += 1
+                else:
+                    # Split into parts in memory
+                    tgt = int(DOC_UPLOAD_LIMIT * 0.8)
+                    entries_per_part = max(
+                        1,
+                        int(len(kw_entries) * tgt / zip_size),
+                    )
+                    for ps in range(0, len(kw_entries), entries_per_part):
+                        part = kw_entries[ps : ps + entries_per_part]
+                        pi = ps // entries_per_part
+                        pn = (
+                            f"{kw}_Cookies.zip" if pi == 0
+                            else f"{kw}_Cookies_{pi}.zip"
+                        )
+                        pbuf = io.BytesIO()
+                        with zipfile.ZipFile(
+                            pbuf, "w",
+                            compression=zipfile.ZIP_STORED,
+                        ) as z:
+                            for arcname, content in part:
+                                z.writestr(arcname, content)
+                        if pbuf.tell() > DOC_UPLOAD_LIMIT:
+                            continue
+                        pbuf.seek(0)
+                        await context.bot.send_document(
+                            chat_id=chat_id,
+                            document=pbuf,
+                            filename=pn,
+                            caption=(
+                                f"🔑 {kw} part {pi + 1} — "
+                                f"{len(part)} set(s)"
+                            ),
+                        )
+                        sent_count += 1
+            elapsed = int(time.time() - started)
+            await _edit(
+                f"✅ Done! Sent {sent_count} keyword zip(s) "
+                f"({grand_cookie_count:,} cookies total).\n"
+                f"⚡ Avg speed: {_human_speed(speed)}"
             )
-        await _edit(
-            f"✅ Done! Sent {_human_bytes(zip_size)} "
-            f"({len(all_cookie_files)} sets, "
-            f"{total_cookie_count} cookies).\n"
-            f"⚡ Avg speed: {_human_speed(speed)}"
-        )
+            job_status = "success" if not errors else "partial"
+            _job_history.append(JobRecord(
+                user_id=user_id, username=username, urls=urls,
+                cookie_count=grand_cookie_count, bytes_read=total_bytes_read,
+                elapsed=elapsed, status=job_status,
+            ))
+        else:
+            # --- Single or split zip (0 or 1 keyword) ---
+            # Build one zip first; if too large, split into parts
+            zip_path = output_dir / "cookies_result.zip"
+            with zipfile.ZipFile(
+                zip_path, "w", compression=zipfile.ZIP_STORED,
+            ) as z:
+                for p in all_cookie_files:
+                    z.write(p, arcname=p.relative_to(output_dir).as_posix())
+
+            zip_size = zip_path.stat().st_size
+
+            if zip_size <= DOC_UPLOAD_LIMIT:
+                # Single zip fits — send it
+                await _edit(
+                    "📤 Uploading result...\n"
+                    f"📦 {len(all_cookie_files)} cookie set(s) — "
+                    f"{total_cookie_count} cookies\n"
+                    f"📡 zip: {_human_bytes(zip_size)}\n"
+                    f"⏱️ Elapsed: {elapsed}s"
+                )
+                with open(zip_path, "rb") as f:
+                    await context.bot.send_document(
+                        chat_id=chat_id,
+                        document=f,
+                        filename=zip_path.name,
+                        caption=(
+                            f"✅ {len(all_cookie_files)} cookie set(s) — "
+                            f"{total_cookie_count} cookies\n"
+                            f"📡 read: {_human_bytes(total_bytes_read)} "
+                            f"({_human_speed(speed)})\n"
+                            f"⏱️ {elapsed}s"
+                        ),
+                    )
+                await _edit(
+                    f"✅ Done! Sent {_human_bytes(zip_size)} "
+                    f"({len(all_cookie_files)} sets, "
+                    f"{total_cookie_count} cookies).\n"
+                    f"⚡ Avg speed: {_human_speed(speed)}"
+                )
+            else:
+                # Zip too large — split into multiple parts
+                await _edit(
+                    f"📦 Result too large for one file "
+                    f"({_human_bytes(zip_size)}). "
+                    "Splitting into parts..."
+                )
+                # Target ~40 MB per part to stay under 50 MB limit
+                target_part_size = int(DOC_UPLOAD_LIMIT * 0.8)
+                files_per_part = max(
+                    1,
+                    int(len(all_cookie_files) * target_part_size / zip_size),
+                )
+                parts_sent = 0
+                for part_start in range(0, len(all_cookie_files), files_per_part):
+                    part_files = all_cookie_files[
+                        part_start:part_start + files_per_part
+                    ]
+                    part_idx = part_start // files_per_part
+                    if part_idx == 0:
+                        part_name = "cookies_result.zip"
+                    else:
+                        part_name = f"cookies_result_{part_idx}.zip"
+                    part_path = output_dir / part_name
+                    with zipfile.ZipFile(
+                        part_path, "w",
+                        compression=zipfile.ZIP_STORED,
+                    ) as z:
+                        for p in part_files:
+                            z.write(
+                                p,
+                                arcname=p.relative_to(output_dir).as_posix(),
+                            )
+                    part_size = part_path.stat().st_size
+                    if part_size > DOC_UPLOAD_LIMIT:
+                        # Still too large — skip with message
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=(
+                                f"⚠️ Part `{part_name}` is still too large "
+                                f"({_human_bytes(part_size)}), skipping."
+                            ),
+                            parse_mode=ParseMode.MARKDOWN,
+                        )
+                        continue
+                    with open(part_path, "rb") as f:
+                        await context.bot.send_document(
+                            chat_id=chat_id,
+                            document=f,
+                            filename=part_name,
+                            caption=(
+                                f"📦 Part {part_idx + 1} — "
+                                f"{len(part_files)} set(s), "
+                                f"{_human_bytes(part_size)}"
+                            ),
+                        )
+                    parts_sent += 1
+
+                await _edit(
+                    f"✅ Done! Sent {parts_sent} zip part(s) "
+                    f"({len(all_cookie_files)} sets, "
+                    f"{total_cookie_count} cookies).\n"
+                    f"⚡ Avg speed: {_human_speed(speed)}"
+                )
+
+            job_status = "success" if not errors else "partial"
+            _job_history.append(JobRecord(
+                user_id=user_id, username=username, urls=urls,
+                cookie_count=total_cookie_count, bytes_read=total_bytes_read,
+                elapsed=elapsed, status=job_status,
+            ))
     finally:
+        _active_jobs.pop(user_id, None)
         context.user_data.clear()
         shutil.rmtree(workdir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Utility commands
+# ---------------------------------------------------------------------------
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show current job status for all admins."""
+    if not _is_admin(update):
+        await _deny_access(update)
+        return
+    if not _active_jobs:
+        await update.message.reply_text("\u2705 No active jobs running.")
+        return
+    lines: list[str] = []
+    for uid, status_text in _active_jobs.items():
+        lines.append(f"\u2022 User `{uid}`: {status_text}")
+    await update.message.reply_text(
+        f"\U0001f504 *Active jobs ({len(_active_jobs)}):*\n" + "\n".join(lines),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show current bot configuration."""
+    if not _is_admin(update):
+        await _deny_access(update)
+        return
+    sevenzip = (
+        shutil.which("7zz") or shutil.which("7z") or shutil.which("7za")
+        or "not found"
+    )
+    unrar = _ensure_unrar() or "not found"
+    text = (
+        "\u2699\ufe0f *Bot Settings*\n\n"
+        f"\u2022 Max download size: `{_human_bytes(MAX_DOWNLOAD_BYTES)}`\n"
+        f"\u2022 Upload limit: `{_human_bytes(DOC_UPLOAD_LIMIT)}`\n"
+        f"\u2022 Download connections: `{DOWNLOAD_CONNECTIONS}`\n"
+        f"\u2022 Admin IDs: `{', '.join(str(i) for i in ADMIN_IDS) or 'everyone'}`\n"
+        f"\u2022 7z binary: `{sevenzip}`\n"
+        f"\u2022 unrar binary: `{unrar}`\n"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show recent job history."""
+    if not _is_admin(update):
+        await _deny_access(update)
+        return
+    if not _job_history:
+        await update.message.reply_text("\U0001f4cb No jobs recorded yet.")
+        return
+
+    lines: list[str] = ["\U0001f4cb *Recent Jobs*\n"]
+    for i, job in enumerate(reversed(list(_job_history)), start=1):
+        ts = time.strftime("%Y-%m-%d %H:%M", time.gmtime(job.timestamp))
+        icon = {
+            "success": "\u2705",
+            "partial": "\u26a0\ufe0f",
+            "failed": "\u274c",
+            "no_cookies": "\u2139\ufe0f",
+        }.get(job.status, "\u2022")
+        links_label = f"{len(job.urls)} link{'s' if len(job.urls) > 1 else ''}"
+        lines.append(
+            f"{i}\\. {icon} `{ts}` \u2014 {links_label}, "
+            f"{job.cookie_count} cookies, {_human_bytes(job.bytes_read)}, "
+            f"{job.elapsed}s ({job.status})"
+        )
+        if i >= 10:
+            remaining = len(_job_history) - 10
+            if remaining > 0:
+                lines.append(f"\n_\\.\\.\\.\\. and {remaining} older job(s)_")
+            break
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2,
+    )
+
+
+async def cmd_connections(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """View or set the number of parallel download connections."""
+    global DOWNLOAD_CONNECTIONS
+    if not _is_admin(update):
+        await _deny_access(update)
+        return
+    args = context.args
+    if args and args[0].isdigit():
+        new_val = max(1, min(64, int(args[0])))
+        DOWNLOAD_CONNECTIONS = new_val
+        await update.message.reply_text(
+            f"\u2705 Download connections set to `{new_val}`.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    else:
+        await update.message.reply_text(
+            f"\U0001f310 Current download connections: `{DOWNLOAD_CONNECTIONS}`\n"
+            "Usage: `/connections <number>` (1\u201364)",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+
+async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show bot version and uptime."""
+    if not _is_admin(update):
+        await _deny_access(update)
+        return
+    uptime_secs = int(time.time() - _BOOT_TIME)
+    hours, remainder = divmod(uptime_secs, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours > 0:
+        uptime_str = f"{hours}h {minutes}m {secs}s"
+    elif minutes > 0:
+        uptime_str = f"{minutes}m {secs}s"
+    else:
+        uptime_str = f"{secs}s"
+
+    jobs_total = len(_job_history)
+    jobs_ok = sum(1 for j in _job_history if j.status == "success")
+
+    text = (
+        "\u2139\ufe0f *Bot Info*\n\n"
+        f"\u2022 Version: `{BOT_VERSION}`\n"
+        f"\u2022 Python: `{platform.python_version()}`\n"
+        f"\u2022 Uptime: `{uptime_str}`\n"
+        f"\u2022 Jobs this session: `{jobs_total}` ({jobs_ok} successful)\n"
+        f"\u2022 OS: `{platform.system()} {platform.release()}`\n"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Quick health check with latency measurement."""
+    if not _is_admin(update):
+        await _deny_access(update)
+        return
+    t0 = time.time()
+    msg = await update.message.reply_text("\U0001f3d3 Pong!")
+    latency_ms = int((time.time() - t0) * 1000)
+    await msg.edit_text(f"\U0001f3d3 Pong!  Latency: `{latency_ms}ms`", parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_disk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show disk usage — useful for Railway's limited storage."""
+    if not _is_admin(update):
+        await _deny_access(update)
+        return
+    usage = shutil.disk_usage("/")
+    tmp_size = 0
+    for entry in glob.iglob("/tmp/logs2cookie-*"):
+        try:
+            if os.path.isdir(entry):
+                for root, _dirs, files in os.walk(entry):
+                    for f in files:
+                        try:
+                            tmp_size += os.path.getsize(os.path.join(root, f))
+                        except OSError:
+                            pass
+        except OSError:
+            pass
+    text = (
+        "\U0001f4be *Disk Usage*\n\n"
+        f"\u2022 Total: `{_human_bytes(usage.total)}`\n"
+        f"\u2022 Used: `{_human_bytes(usage.used)}` ({usage.used * 100 // usage.total}%)\n"
+        f"\u2022 Free: `{_human_bytes(usage.free)}`\n"
+        f"\u2022 Bot temp files: `{_human_bytes(tmp_size)}`\n"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show RAM usage — monitor for OOM on Railway."""
+    if not _is_admin(update):
+        await _deny_access(update)
+        return
+    vm = psutil.virtual_memory()
+    proc = psutil.Process(os.getpid())
+    proc_mem = proc.memory_info()
+    text = (
+        "\U0001f9e0 *Memory Usage*\n\n"
+        f"*System:*\n"
+        f"\u2022 Total: `{_human_bytes(vm.total)}`\n"
+        f"\u2022 Used: `{_human_bytes(vm.used)}` ({vm.percent}%)\n"
+        f"\u2022 Available: `{_human_bytes(vm.available)}`\n\n"
+        f"*Bot process:*\n"
+        f"\u2022 RSS: `{_human_bytes(proc_mem.rss)}`\n"
+        f"\u2022 VMS: `{_human_bytes(proc_mem.vms)}`\n"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Clean temp files to free disk space."""
+    if not _is_admin(update):
+        await _deny_access(update)
+        return
+    removed = 0
+    freed = 0
+    for entry in glob.iglob("/tmp/logs2cookie-*"):
+        try:
+            if os.path.isdir(entry):
+                size = 0
+                for root, _dirs, files in os.walk(entry):
+                    for f in files:
+                        try:
+                            size += os.path.getsize(os.path.join(root, f))
+                        except OSError:
+                            pass
+                shutil.rmtree(entry, ignore_errors=True)
+                removed += 1
+                freed += size
+        except OSError:
+            pass
+    text = (
+        "\U0001f9f9 *Cleanup Complete*\n\n"
+        f"\u2022 Directories removed: `{removed}`\n"
+        f"\u2022 Space freed: `{_human_bytes(freed)}`\n"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_admins(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show current admin list."""
+    if not _is_admin(update):
+        await _deny_access(update)
+        return
+    if ADMIN_IDS:
+        admin_lines = "\n".join(f"\u2022 `{uid}`" for uid in sorted(ADMIN_IDS))
+        text = f"\U0001f464 *Admins ({len(ADMIN_IDS)}):*\n\n{admin_lines}"
+    else:
+        text = "\U0001f464 *Admins:* Everyone (no restriction)"
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_speed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show worker/thread configuration."""
+    if not _is_admin(update):
+        await _deny_access(update)
+        return
+    cpu_count = os.cpu_count() or 1
+    text = (
+        "\u26a1 *Speed Configuration*\n\n"
+        f"*System:*\n"
+        f"\u2022 CPU cores: `{cpu_count}`\n"
+        f"\u2022 Max file size: `{_human_bytes(MAX_DOWNLOAD_BYTES)}`\n\n"
+        f"*Download:*\n"
+        f"\u2022 Parallel connections: `{DOWNLOAD_CONNECTIONS}`\n\n"
+        f"*Conversion:*\n"
+        f"\u2022 Max workers: `500`\n"
+        f"\u2022 Scales: 1 worker per 10 files (min 8)\n"
+        f"\u2022 Batch size: 500\u20135000 files\n\n"
+        f"*Classification:*\n"
+        f"\u2022 Max workers: `500`\n"
+        f"\u2022 Scales: 1 worker per 10 files (min 8)\n"
+        f"\u2022 Batch size: 500\u20135000 files\n\n"
+        f"*Extraction:*\n"
+        f"\u2022 7z: multi-threaded (`-mmt=on`)\n"
+        f"\u2022 unrar: 8 threads (`-mt8`)\n"
+        f"\u2022 Timeout: scales with file size (no cap)\n"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_logs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show recent warnings/errors from the bot log."""
+    if not _is_admin(update):
+        await _deny_access(update)
+        return
+    records = list(_ring_handler.records)
+    if not records:
+        await update.message.reply_text("\u2705 No warnings or errors logged.")
+        return
+    # Show last 15 entries max to avoid hitting Telegram message limits
+    entries = records[-15:]
+    lines = "\n".join(f"`{r}`" for r in entries)
+    text = f"\U0001f4dc *Recent Warnings/Errors ({len(records)} total):*\n\n{lines}"
+    # Truncate if too long for Telegram (4096 char limit)
+    if len(text) > 4000:
+        text = text[:4000] + "\n\n_(truncated)_"
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 
 # ---------------------------------------------------------------------------
@@ -485,7 +1513,7 @@ def build_app() -> Application:
             "provider's environment variables."
         )
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
 
     conv = ConversationHandler(
         entry_points=[
@@ -493,16 +1521,24 @@ def build_app() -> Application:
             CommandHandler("help", cmd_help),
         ],
         states={
+            ASK_MODE: [
+                CallbackQueryHandler(on_mode_button, pattern="^mode_"),
+                CommandHandler("cancel", cmd_cancel),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, on_mode_text),
+            ],
             ASK_URL: [
+                CallbackQueryHandler(_on_exit_button, pattern="^exit_conv$"),
                 CommandHandler("cancel", cmd_cancel),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, on_url),
             ],
             ASK_PASSWORD: [
+                CallbackQueryHandler(_on_exit_button, pattern="^exit_conv$"),
                 CommandHandler("cancel", cmd_cancel),
                 CommandHandler("skip", on_password),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, on_password),
             ],
             ASK_KEYWORDS: [
+                CallbackQueryHandler(_on_exit_button, pattern="^exit_conv$"),
                 CommandHandler("cancel", cmd_cancel),
                 CommandHandler("skip", on_keywords),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, on_keywords),
@@ -511,15 +1547,30 @@ def build_app() -> Application:
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
         name="logs2cookie_conv",
         persistent=False,
+        per_user=True,
+        per_chat=True,
+        allow_reentry=True,
     )
 
     app.add_handler(conv)
     app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("settings", cmd_settings))
+    app.add_handler(CommandHandler("history", cmd_history))
+    app.add_handler(CommandHandler("connections", cmd_connections))
+    app.add_handler(CommandHandler("info", cmd_info))
+    app.add_handler(CommandHandler("ping", cmd_ping))
+    app.add_handler(CommandHandler("disk", cmd_disk))
+    app.add_handler(CommandHandler("memory", cmd_memory))
+    app.add_handler(CommandHandler("cleanup", cmd_cleanup))
+    app.add_handler(CommandHandler("admins", cmd_admins))
+    app.add_handler(CommandHandler("speed", cmd_speed))
+    app.add_handler(CommandHandler("logs", cmd_logs))
     return app
 
 
 def _check_extractor_binaries() -> None:
-    """Warn loudly at startup if the archive extractor isn't on PATH."""
+    """Ensure extraction tools are available at startup."""
     def _first_on_path(candidates: Sequence[str]) -> Optional[str]:
         for c in candidates:
             p = shutil.which(c)
@@ -532,12 +1583,44 @@ def _check_extractor_binaries() -> None:
         log.warning(
             "7z binary not found on PATH (looked for %s). "
             "All archive extraction (zip / 7z / rar) will fail at "
-            "runtime. Install p7zip-full on your host (Railway: see "
-            "railpack.json; Debian/Ubuntu: apt-get install p7zip-full).",
+            "runtime. Install 7zip (apt-get install 7zip) or "
+            "p7zip-full on your host.",
             ", ".join(SEVENZIP_BINARIES),
         )
     else:
         log.info("7z binary OK: %s (handles zip, 7z, rar)", sevenzip)
+
+    # Pre-download unrar so RAR5 extraction doesn't delay the first job
+    unrar_path = _ensure_unrar()
+    if unrar_path:
+        log.info("unrar binary OK: %s (handles RAR5)", unrar_path)
+    else:
+        log.warning(
+            "unrar binary not available — RAR5 archives may fail to "
+            "extract. 7z will be tried as fallback."
+        )
+
+
+async def _post_init(application: Application) -> None:
+    """Register the bot menu commands after the application starts."""
+    await application.bot.set_my_commands([
+        BotCommand("start", "Start — choose Cookie or ULP mode"),
+        BotCommand("help", "Show all commands"),
+        BotCommand("status", "Check active jobs"),
+        BotCommand("settings", "View bot configuration"),
+        BotCommand("history", "Recent job history"),
+        BotCommand("connections", "View/set download connections"),
+        BotCommand("info", "Bot version & uptime"),
+        BotCommand("ping", "Health check with latency"),
+        BotCommand("disk", "Show disk usage"),
+        BotCommand("memory", "Show RAM usage"),
+        BotCommand("cleanup", "Clear temp files"),
+        BotCommand("admins", "Show admin list"),
+        BotCommand("speed", "Worker/thread configuration"),
+        BotCommand("logs", "Recent warnings & errors"),
+        BotCommand("cancel", "Cancel current job"),
+    ])
+    log.info("Bot menu commands registered.")
 
 
 def main() -> None:

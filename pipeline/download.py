@@ -38,7 +38,7 @@ DEFAULT_USER_AGENT = (
 )
 MAX_RETRIES = 3
 RETRY_BACKOFF_BASE = 1.5  # seconds
-DEFAULT_CONNECTIONS = int(os.getenv("DOWNLOAD_CONNECTIONS", "16"))
+DEFAULT_CONNECTIONS = int(os.getenv("DOWNLOAD_CONNECTIONS", "32"))
 MIN_SEGMENT_SIZE = 2 * 1024 * 1024  # 2 MB — no point splitting smaller
 
 

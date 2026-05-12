@@ -133,11 +133,14 @@ def write_netscape_file(path: Path, cookies: Iterable[CookieRow]) -> int:
     Returns the number of rows written.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Build output in memory then write once (much faster than many writes)
+    lines = [NETSCAPE_HEADER]
     n = 0
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        f.write(NETSCAPE_HEADER)
-        for row in cookies:
-            f.write(row.to_line())
-            f.write("\n")
-            n += 1
+    for row in cookies:
+        lines.append(row.to_line())
+        lines.append("\n")
+        n += 1
+    if n:
+        with open(path, "w", encoding="utf-8", newline="\n", buffering=65536) as f:
+            f.write("".join(lines))
     return n

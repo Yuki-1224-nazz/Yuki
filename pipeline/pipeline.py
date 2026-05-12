@@ -69,6 +69,19 @@ ULP_FILENAME_HINTS: tuple[str, ...] = (
     "all passwords",
 )
 
+# Path-level hints: if ANY component of the full file path matches
+# one of these, the file is a candidate for ULP scanning.
+_ULP_PATH_HINTS: tuple[str, ...] = (
+    "password",
+    "passwords",
+    "login",
+    "logins",
+    "credential",
+    "credentials",
+    "autologin",
+    "all passwords",
+)
+
 # Regex patterns for extracting credentials (from v4.py)
 _ULP_PATTERNS = [
     re.compile(
@@ -268,6 +281,16 @@ def _scan_and_convert_one(
 _MAX_ULP_FILE_BYTES = 1024 * 1024  # 1 MB — password files can be slightly larger
 
 
+def _is_ulp_candidate(file_path_str: str) -> bool:
+    """Fast check: is this file likely to contain credentials?
+
+    Checks path components (directories + filename) against known hints.
+    Much faster than opening + regex-scanning every .txt file.
+    """
+    low = file_path_str.lower()
+    return any(h in low for h in _ULP_PATH_HINTS)
+
+
 def _scan_and_extract_ulp(
     args: tuple,
 ) -> Optional[tuple[str, int, Optional[dict]]]:
@@ -280,13 +303,6 @@ def _scan_and_extract_ulp(
     so keywords like ``com.garena.gaslite`` match against the URL field.
     """
     idx, file_path_str, kw_lowers = args
-    name = os.path.basename(file_path_str)
-    lname = name.lower()
-
-    # Accept .txt files and files with ULP hints
-    is_hint = any(h in lname for h in ULP_FILENAME_HINTS)
-    if not is_hint and not lname.endswith(".txt"):
-        return None
 
     try:
         size = os.path.getsize(file_path_str)
@@ -491,12 +507,25 @@ async def async_run_pipeline(
 
         if mode == "ulp":
             # --- ULP mode: extract user:pass credentials ---
-            status(f"🔑 Scanning {total_files:,} files for credentials...")
-            work_items_ulp = [
-                (i, fp, kw_lowers)
-                for i, fp in enumerate(all_files, start=1)
+            # Pre-filter: only scan files whose path contains credential
+            # hints (password, login, credentials, etc.) — this cuts
+            # 103K files down to a few thousand, avoiding massive I/O waste.
+            ulp_files = [
+                fp for fp in all_files if _is_ulp_candidate(fp)
             ]
             del all_files
+            ulp_count = len(ulp_files)
+            status(
+                f"🔑 Found {ulp_count:,} credential files "
+                f"(out of {total_files:,} total)... scanning"
+            )
+
+            ulp_workers = min(500, max(8, ulp_count // 10))
+            work_items_ulp = [
+                (i, fp, kw_lowers)
+                for i, fp in enumerate(ulp_files, start=1)
+            ]
+            del ulp_files
 
             def _process_ulp_result(r: Optional[tuple]) -> None:
                 if r is None:
@@ -506,7 +535,6 @@ async def async_run_pipeline(
                     stripped = line.strip()
                     if stripped:
                         result.ulp_credentials.add(stripped)
-                # Merge per-keyword results
                 if per_kw:
                     for kw, creds_set in per_kw.items():
                         if kw not in result.ulp_per_keyword:
@@ -520,7 +548,7 @@ async def async_run_pipeline(
             else:
                 processed = 0
                 last_status = _time.time()
-                with ThreadPoolExecutor(max_workers=workers) as pool:
+                with ThreadPoolExecutor(max_workers=ulp_workers) as pool:
                     futs = [
                         loop.run_in_executor(
                             pool, _scan_and_extract_ulp, item,
@@ -536,7 +564,7 @@ async def async_run_pipeline(
                             elapsed_conv = now - convert_start
                             status(
                                 f"🔑 Scanning... "
-                                f"{processed:,}/{total_files:,} files "
+                                f"{processed:,}/{ulp_count:,} files "
                                 f"({result.ulp_count:,} credentials, "
                                 f"{elapsed_conv:.0f}s)"
                             )

@@ -83,13 +83,10 @@ _ULP_PATH_HINTS: tuple[str, ...] = (
 )
 
 # Regex patterns for extracting credentials (from v4.py)
+# Ordered from most specific → least specific so the first match wins.
 _ULP_PATTERNS = [
     re.compile(
         r"URL:\s*(https?://\S+)\s+USER:\s*(\S+)\s+PASS:\s*(\S+)",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"SOFT:\s*Chrome Profile.*\nURL:\s*(\S+)\nUSER:\s*(\S+)\nPASS:\s*(\S+)",
         re.IGNORECASE,
     ),
     re.compile(
@@ -98,6 +95,10 @@ _ULP_PATTERNS = [
     ),
     re.compile(r"USER:\s*(\S+)\s*PASS:\s*(\S+)", re.IGNORECASE),
 ]
+
+# Quick byte-level check — if a file doesn't contain these markers
+# it can't match any of our patterns, so skip the regex entirely.
+_ULP_QUICK_MARKERS = (b"URL:", b"url:", b"USER:", b"user:", b"PASS:", b"pass:")
 
 
 def extract_credentials_from_text(
@@ -166,6 +167,32 @@ def _fast_listdir(root: str) -> List[str]:
         except OSError:
             pass
     return result
+
+
+def _fast_listdir_ulp(root: str) -> tuple[List[str], int]:
+    """List only ULP-candidate files, skipping irrelevant directories.
+
+    Returns ``(ulp_files, total_file_count)``.
+    Skips entire directory subtrees that cannot contain credentials
+    (e.g. Cookies/, Autofill/, Screenshots/) for massive speedup.
+    """
+    ulp_files: List[str] = []
+    total = 0
+    stack = [root]
+    while stack:
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                for entry in it:
+                    if entry.is_file(follow_symlinks=False):
+                        total += 1
+                        if _is_ulp_candidate(entry.path):
+                            ulp_files.append(entry.path)
+                    elif entry.is_dir(follow_symlinks=False):
+                        stack.append(entry.path)
+        except OSError:
+            pass
+    return ulp_files, total
 
 
 def _fast_file_count(root: str) -> int:
@@ -320,10 +347,14 @@ def _scan_and_extract_ulp(
     except OSError:
         return None
 
+    # Quick byte-level pre-check: skip files that can't possibly
+    # contain structured credentials (no USER:/PASS: markers).
+    if not any(marker in raw for marker in _ULP_QUICK_MARKERS):
+        return None
+
     text = raw.decode("utf-8", errors="replace")
 
     if not kw_lowers:
-        # No keywords — extract all credentials
         creds = extract_credentials_from_text(text)
         if not creds:
             return None
@@ -498,22 +529,13 @@ async def async_run_pipeline(
 
         # Combined scan + convert in ONE pass (no separate scan step)
         convert_start = _time.time()
-        all_files = await loop.run_in_executor(
-            None, lambda: _fast_listdir(str(extracted))
-        )
-        total_files = len(all_files)
-
-        workers = min(500, max(8, total_files // 10))
 
         if mode == "ulp":
-            # --- ULP mode: extract user:pass credentials ---
-            # Pre-filter: only scan files whose path contains credential
-            # hints (password, login, credentials, etc.) — this cuts
-            # 103K files down to a few thousand, avoiding massive I/O waste.
-            ulp_files = [
-                fp for fp in all_files if _is_ulp_candidate(fp)
-            ]
-            del all_files
+            # ULP mode: use specialized lister that filters during
+            # traversal — never builds a 103K item list in memory.
+            ulp_files, total_files = await loop.run_in_executor(
+                None, lambda: _fast_listdir_ulp(str(extracted))
+            )
             ulp_count = len(ulp_files)
             status(
                 f"🔑 Found {ulp_count:,} credential files "
@@ -570,6 +592,11 @@ async def async_run_pipeline(
                             )
         else:
             # --- Cookie mode: scan + convert cookies ---
+            all_files = await loop.run_in_executor(
+                None, lambda: _fast_listdir(str(extracted))
+            )
+            total_files = len(all_files)
+            workers = min(500, max(8, total_files // 10))
             status(f"🔄 Processing {total_files:,} files...")
             cookies_dir_str = str(cookies_dir)
             extracted_str = str(extracted)

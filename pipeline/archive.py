@@ -384,7 +384,7 @@ def _extract_with_unrar(
     if bin_path is None:
         log.warning("unrar binary not available, skipping")
         return None
-    cmd = [bin_path, "x", "-y", "-o+", "-mt8"]
+    cmd = [bin_path, "x", "-y", "-o+", "-mt16"]
     if password is not None and password != "":
         cmd.append(f"-p{password}")
     else:

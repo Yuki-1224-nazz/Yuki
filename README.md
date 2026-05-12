@@ -26,7 +26,7 @@ FEEDBACK   ⏳ Downloading... ▓▓░░  ⚙ Processing...  🔄 Converting..
 
 | Phase | What happens |
 |---|---|
-| **START** | User sends `/start`. The bot greets them and asks for one or more *direct download URLs* (comma or space separated). |
+| **START** | User sends `/start`. The bot presents three modes: **Logs to Cookie** (Netscape cookie files), **Logs to ULP** (`user:pass`), and **Logs to ULP (URL)** (`url:user:pass`). |
 | **INPUT** | The bot collects three things in sequence: the URL(s), an archive password (skippable), and an optional keyword filter (skippable). Multiple URLs are downloaded and processed in parallel. |
 | **PROCESS** | The bot streams the URL in 64 KB chunks to a temp file, then sniffs the first few bytes to detect zip/7z/rar (so tokenised CDN URLs without `.zip`/`.7z`/`.rar` in the path also work). Archives are extracted with the supplied password; every cookie file inside is parsed. Each detected *cookie set* (one per source file) is emitted as its own Netscape `.txt` file. |
 | **OUTPUT** | Every output `.txt` is bundled into `cookies_result.zip` and uploaded as a Telegram document. If the zip exceeds Telegram's 50 MB bot upload limit, the bot stops with a clear error and asks the user to re-run with a stricter keyword filter. |

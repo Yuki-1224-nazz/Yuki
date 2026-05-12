@@ -317,7 +317,8 @@ async def on_mode_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.edit_message_text(
             "🌐 *Logs to ULP (URL)* mode selected.\n\n"
             "Send me one or more *direct download URLs* to your logs "
-            "(comma or space separated). I'll extract all "
+            "(comma or space separated), *or upload a .txt file* "
+            "containing `url:user:pass` lines. I'll extract all "
             "`url:user:pass` credentials from the archive.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=_EXIT_KB,
@@ -361,7 +362,8 @@ async def on_mode_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         await update.message.reply_text(
             "🌐 *Logs to ULP (URL)* mode selected.\n\n"
             "Send me one or more *direct download URLs* to your logs "
-            "(comma or space separated).\n\n"
+            "(comma or space separated), *or upload a .txt file* "
+            "containing `url:user:pass` lines.\n\n"
             "At any time you can send /cancel to abort.",
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -473,6 +475,53 @@ async def on_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ASK_PASSWORD
 
 
+async def on_document_upload(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    """Handle .txt file upload in ULP (URL) mode.
+
+    Downloads the file, stores its path, and skips straight to keywords.
+    """
+    mode = context.user_data.get("mode", "cookie")
+    doc = update.message.document
+
+    if mode != "ulp_url" or doc is None:
+        await update.message.reply_text(
+            "File uploads are only supported in *ULP (URL)* mode.\n"
+            "Please send a download URL instead, or /cancel.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return ASK_URL
+
+    fname = (doc.file_name or "").lower()
+    if not fname.endswith(".txt"):
+        await update.message.reply_text(
+            "Please upload a `.txt` file containing `url:user:pass` "
+            "lines, or send a download URL instead.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return ASK_URL
+
+    await update.message.reply_text("📥 Downloading your file...")
+    tg_file = await doc.get_file()
+    tmp_dir = Path(tempfile.mkdtemp(prefix="ulpfile-"))
+    local_path = tmp_dir / (doc.file_name or "upload.txt")
+    await tg_file.download_to_drive(str(local_path))
+
+    context.user_data["uploaded_file"] = str(local_path)
+    context.user_data["urls"] = []
+    context.user_data["passwords"] = []
+
+    await update.message.reply_text(
+        f"📄 Got `{doc.file_name}` "
+        f"({_human_bytes(local_path.stat().st_size)}).\n\n"
+        "🔎 Send *keywords* to filter credentials by "
+        "(comma-separated), or send /skip to keep all.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return ASK_KEYWORDS
+
+
 def _parse_passwords(text: str, num_urls: int) -> list[Optional[str]]:
     """Parse comma-separated passwords and align them with URLs.
 
@@ -553,8 +602,226 @@ async def on_keywords(
         keywords = _split_keywords(text)
 
     context.user_data["keywords"] = keywords
-    await _run_job(update, context)
+
+    # If we have an uploaded file, process it directly
+    uploaded_file = context.user_data.get("uploaded_file")
+    if uploaded_file:
+        await _process_uploaded_ulp_file(update, context, keywords)
+    else:
+        await _run_job(update, context)
     return ConversationHandler.END
+
+
+# ---------------------------------------------------------------------------
+# Uploaded .txt file processing (ULP URL mode)
+# ---------------------------------------------------------------------------
+async def _process_uploaded_ulp_file(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    keywords: list[str],
+) -> None:
+    """Process an uploaded .txt file with url:user:pass lines."""
+    uploaded_path = Path(context.user_data["uploaded_file"])
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    username = update.effective_user.username or str(user_id)
+    started = time.time()
+
+    _active_jobs[user_id] = "Processing uploaded file..."
+    status_msg = await context.bot.send_message(
+        chat_id=chat_id, text="⚙ Processing uploaded file...",
+    )
+
+    last_text = ""
+    _edit_lock = asyncio.Lock()
+
+    async def _edit(text: str) -> None:
+        nonlocal last_text
+        async with _edit_lock:
+            if text == last_text:
+                return
+            last_text = text
+            try:
+                await status_msg.edit_text(text)
+            except Exception:
+                pass
+
+    try:
+        raw = uploaded_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        await _edit(f"❌ Failed to read file: {exc}")
+        _active_jobs.pop(user_id, None)
+        return
+
+    kw_lowers = [kw.strip().lower() for kw in keywords if kw.strip()]
+    lines = raw.splitlines()
+    total_lines = len(lines)
+
+    await _edit(f"⚙ Scanning {total_lines:,} lines...")
+
+    matched: list[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped in seen:
+            continue
+        if kw_lowers:
+            low = stripped.lower()
+            if not any(kw in low for kw in kw_lowers):
+                continue
+        seen.add(stripped)
+        matched.append(stripped)
+
+    elapsed = int(time.time() - started)
+    total_cred_count = len(matched)
+    file_size = uploaded_path.stat().st_size
+
+    if not matched:
+        await _edit(
+            "ℹ️ Done — no matching credentials found.\n"
+            f"📄 Scanned {total_lines:,} lines\n"
+            f"⏱️ {elapsed}s"
+        )
+        _active_jobs.pop(user_id, None)
+        _job_history.append(JobRecord(
+            user_id=user_id, username=username, urls=[],
+            cookie_count=0, bytes_read=file_size,
+            elapsed=elapsed, status="no_credentials",
+        ))
+        return
+
+    output_dir = uploaded_path.parent / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if len(keywords) > 1:
+        # Per-keyword .txt files
+        _active_jobs[user_id] = "Splitting by keywords..."
+        await _edit(
+            f"🔑 Splitting {total_cred_count:,} credentials "
+            f"by {len(keywords)} keywords..."
+        )
+        grand_count = 0
+        for kw_idx, kw in enumerate(keywords, start=1):
+            kw_low = kw.strip().lower()
+            kw_matched = sorted(
+                c for c in matched if kw_low in c.lower()
+            )
+            if not kw_matched:
+                continue
+            grand_count += len(kw_matched)
+            safe_kw = re.sub(r"[^A-Za-z0-9_-]+", "_", kw.strip())[:40] or "results"
+            await _send_txt_parts(
+                context, chat_id, kw_matched, output_dir,
+                base_name=f"{safe_kw}_Results",
+                caption_prefix=f"🔑 {kw}",
+                kw_idx=kw_idx, kw_total=len(keywords),
+                _edit=_edit,
+            )
+        await _edit(
+            f"✅ Done! {grand_count:,} credentials "
+            f"across {len(keywords)} keywords.\n"
+            f"📄 Scanned {total_lines:,} lines\n"
+            f"⏱️ {elapsed}s"
+        )
+    else:
+        # Single/no keyword — one result
+        sorted_creds = sorted(matched)
+        await _send_txt_parts(
+            context, chat_id, sorted_creds, output_dir,
+            base_name="ulp_url_results",
+            caption_prefix="🔑",
+            _edit=_edit,
+            fmt_label="url:user:pass",
+        )
+        await _edit(
+            f"✅ Done! {total_cred_count:,} credentials "
+            f"(url:user:pass, deduplicated).\n"
+            f"📄 Scanned {total_lines:,} lines\n"
+            f"⏱️ {elapsed}s"
+        )
+
+    _active_jobs.pop(user_id, None)
+    _job_history.append(JobRecord(
+        user_id=user_id, username=username, urls=[],
+        cookie_count=total_cred_count, bytes_read=file_size,
+        elapsed=elapsed, status="success",
+    ))
+
+    # Cleanup
+    try:
+        shutil.rmtree(uploaded_path.parent, ignore_errors=True)
+    except OSError:
+        pass
+
+
+async def _send_txt_parts(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    creds: list[str],
+    output_dir: Path,
+    *,
+    base_name: str = "results",
+    caption_prefix: str = "🔑",
+    kw_idx: int = 0,
+    kw_total: int = 0,
+    _edit: Optional[Callable] = None,
+    fmt_label: str = "",
+) -> None:
+    """Write credentials to .txt and upload, splitting at 50 MB."""
+    content = "\n".join(creds) + "\n"
+    content_bytes = content.encode("utf-8")
+    txt_path = output_dir / f"{base_name}.txt"
+    txt_path.write_bytes(content_bytes)
+    txt_size = txt_path.stat().st_size
+
+    kw_tag = f" ({kw_idx}/{kw_total})" if kw_total > 0 else ""
+
+    if txt_size <= DOC_UPLOAD_LIMIT:
+        if _edit:
+            await _edit(f"📤 Sending {base_name}.txt{kw_tag}...")
+        cap = f"{caption_prefix} — {len(creds):,} credentials"
+        if fmt_label:
+            cap += f" ({fmt_label}, deduplicated)"
+        cap += f"\n📄 {_human_bytes(txt_size)}"
+        with open(txt_path, "rb") as f:
+            await context.bot.send_document(
+                chat_id=chat_id, document=f,
+                filename=f"{base_name}.txt", caption=cap,
+            )
+    else:
+        if _edit:
+            await _edit(
+                f"📄 {base_name}.txt too large "
+                f"({_human_bytes(txt_size)}). Splitting..."
+            )
+        lines_per_part = max(1, int(
+            len(creds) * DOC_UPLOAD_LIMIT * 0.8 / txt_size
+        ))
+        part_num = 0
+        for ps in range(0, len(creds), lines_per_part):
+            part_creds = creds[ps:ps + lines_per_part]
+            part_num += 1
+            pname = (
+                f"{base_name}.txt" if part_num == 1
+                else f"{base_name}_{part_num}.txt"
+            )
+            ppath = output_dir / pname
+            ppath.write_text("\n".join(part_creds) + "\n", encoding="utf-8")
+            psize = ppath.stat().st_size
+            if psize > DOC_UPLOAD_LIMIT:
+                continue
+            with open(ppath, "rb") as f:
+                await context.bot.send_document(
+                    chat_id=chat_id, document=f,
+                    filename=pname,
+                    caption=(
+                        f"{caption_prefix} (part {part_num}) — "
+                        f"{len(part_creds):,} credentials, "
+                        f"{_human_bytes(psize)}"
+                    ),
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -1557,6 +1824,7 @@ def build_app() -> Application:
             ASK_URL: [
                 CallbackQueryHandler(_on_exit_button, pattern="^exit_conv$"),
                 CommandHandler("cancel", cmd_cancel),
+                MessageHandler(filters.Document.ALL, on_document_upload),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, on_url),
             ],
             ASK_PASSWORD: [

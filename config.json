@@ -1,0 +1,17 @@
+{
+    "telegram_bot_token": "YOUR_BOT_TOKEN_HERE",
+    "chat_ids": [
+        "CHAT_ID_1",
+        "CHAT_ID_2"
+    ],
+    "scraper": {
+        "timeout": 5,
+        "max_concurrent": 300,
+        "check_google": true,
+        "google_timeout": 8,
+        "proxy_types": ["http", "socks4", "socks5"],
+        "output_format": null,
+        "refresh_interval_minutes": 30,
+        "auto_loop": true
+    }
+}
